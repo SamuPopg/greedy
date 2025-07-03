@@ -498,84 +498,196 @@ class LoadingOptimizer:
                 self.supplier_order[-1].boundary_end = CONTAINER_LENGTH
     
     def place_cargo_in_zone(self, cargo: Cargo, supplier: Supplier) -> bool:
-        """在指定区域内放置货物"""
+        """在指定区域内放置货物 - 优化版"""
         # 获取该区域内的可用空间
         zone_spaces = [
             space for space in self.container.available_spaces
             if space.x + space.length > supplier.boundary_start and space.x < supplier.boundary_end
         ]
         
-        # 如果没有可用空间，返回失败
         if not zone_spaces:
             return False
         
-        # 尝试所有可能的摆放方式和位置
+        # 输出调试信息
+        if cargo.volume > 500000:
+            print(f"    正在尝试放置大型货物: {cargo.id}, 体积: {cargo.volume/1000000:.2f}m³")
+        
+        # 进度跟踪变量
+        total_spaces = len(zone_spaces)
+        space_counter = 0
+        position_counter = 0
+        last_progress_time = time.time()
+        progress_interval = 3  # 每3秒输出一次
+        
         best_score = -float('inf')
         best_space = None
         best_orientation = None
         best_position = None
         
+        # 根据体积对空间排序（优先尝试大小合适的空间）
+        cargo_volume = cargo.volume
+        zone_spaces.sort(key=lambda s: abs(s.volume - cargo_volume))
+        
         for space in zone_spaces:
-            for orientation in range(6):  # 6种摆放方式
+            space_counter += 1
+            
+            # 定期输出进度信息
+            current_time = time.time()
+            if current_time - last_progress_time > progress_interval:
+                print(f"    搜索进度: 已检查 {space_counter}/{total_spaces} 空间, {position_counter} 个位置")
+                last_progress_time = current_time
+            
+            # 初步筛选：如果空间太小则跳过
+            if space.volume < cargo_volume * 0.9:  # 允许10%的误差
+                continue
+            
+            for orientation in range(6):
                 # 检查是否符合摆放规则
                 if not self.check_orientation_rules(orientation, space.z):
                     continue
                 
                 # 检查货物是否能放入空间
+                cargo_dims = cargo.get_dimensions(orientation)
                 if not space.can_fit(cargo, orientation):
                     continue
                 
-                # 计算评分 (接触面积 - 剩余空间体积)
-                contact_area = cargo.get_contact_area(orientation)
-                cargo_dims = cargo.get_dimensions(orientation)
+                # 1. 首先尝试角落位置 (优先角落原则)
+                corner_positions = [
+                    (space.x, space.y, space.z),  # 左下角
+                    (space.x + space.length - cargo_dims[0], space.y, space.z),  # 右下角
+                    (space.x, space.y + space.width - cargo_dims[1], space.z),  # 左上角
+                    (space.x + space.length - cargo_dims[0], space.y + space.width - cargo_dims[1], space.z)  # 右上角
+                ]
                 
-                # 尝试不同的放置位置
-                for x_pos in range(space.x, space.x + space.length - int(cargo_dims[0]) + 1, max(1, GRID_SIZE)):
-                    for y_pos in range(space.y, space.y + space.width - int(cargo_dims[1]) + 1, max(1, GRID_SIZE)):
-                        position = (x_pos, y_pos, space.z)
+                # 检查角落位置
+                for position in corner_positions:
+                    position_counter += 1
+                    x_pos, y_pos, z_pos = position
+                    
+                    # 边界检查
+                    if (x_pos < 0 or y_pos < 0 or z_pos < 0 or
+                        x_pos + cargo_dims[0] > space.x + space.length or
+                        y_pos + cargo_dims[1] > space.y + space.width or
+                        z_pos + cargo_dims[2] > space.z + space.height):
+                        continue
+                    
+                    # 检查是否与已有货物重叠
+                    if self.container.check_overlap(position, cargo_dims):
+                        continue
+                    
+                    # 检查是否满足摆放规则
+                    if not self.container.check_placement_rules(position, orientation, cargo_dims[2]):
+                        continue
+                    
+                    # 计算评分因素
+                    contact_area = cargo.get_contact_area(orientation)
+                    remaining_volume = space.volume - cargo_dims[0] * cargo_dims[1] * cargo_dims[2]
+                    distance_to_boundary = min(
+                        abs(x_pos - supplier.boundary_start),
+                        abs(x_pos + cargo_dims[0] - supplier.boundary_end)
+                    )
+                    distance_to_bottom = space.z
+                    neighbor_contact = self._calculate_neighbor_contact(position, cargo_dims)
+                    
+                    # 计算评分
+                    score = (
+                        10.0 * contact_area + 
+                        5.0 * neighbor_contact - 
+                        0.1 * remaining_volume - 
+                        1.0 * distance_to_boundary - 
+                        2.0 * distance_to_bottom
+                    )
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_space = space
+                        best_orientation = orientation
+                        best_position = position
+                
+                # 2. 如果角落不行，则使用两级搜索策略
+                # 首先是大步长搜索寻找可能的区域
+                if best_score == -float('inf'):  # 如果角落尝试失败
+                    coarse_step = max(10, GRID_SIZE * 5)  # 粗搜索步长
+                    potential_positions = []
+                    
+                    for x_pos in range(int(space.x), int(space.x + space.length - cargo_dims[0] + 1), int(coarse_step)):
+                        for y_pos in range(int(space.y), int(space.y + space.width - cargo_dims[1] + 1), int(coarse_step)):
+                            position = (x_pos, y_pos, space.z)
+                            position_counter += 1
+                            
+                            # 基础检查
+                            if not self.container.check_overlap(position, cargo_dims) and \
+                               self.container.check_placement_rules(position, orientation, cargo_dims[2]):
+                                # 简化评分计算
+                                quick_score = cargo.get_contact_area(orientation) - 2.0 * space.z
+                                potential_positions.append((position, quick_score))
+                    
+                    # 对有潜力的位置进行排序并选择前N个进行精细搜索
+                    potential_positions.sort(key=lambda x: x[1], reverse=True)
+                    refined_positions = potential_positions[:min(10, len(potential_positions))]
+                    
+                    # 精细搜索阶段
+                    fine_step = max(2, GRID_SIZE)  # 精细搜索步长
+                    for base_pos, _ in refined_positions:
+                        base_x, base_y, base_z = base_pos
                         
-                        # 检查是否与已有货物重叠
-                        if self.container.check_overlap(position, cargo_dims):
-                            continue
-                        
-                        # 检查是否满足摆放规则
-                        if not self.container.check_placement_rules(position, orientation, cargo_dims[2]):
-                            continue
-                        
-                        # 计算剩余空间体积
-                        remaining_volume = space.volume - cargo_dims[0] * cargo_dims[1] * cargo_dims[2]
-                        
-                        # 计算与集装箱边界的贴近程度 (越小越好)
-                        distance_to_boundary = min(
-                            abs(x_pos - supplier.boundary_start),
-                            abs(x_pos + cargo_dims[0] - supplier.boundary_end)
-                        )
-                        
-                        # 计算与底部的贴近程度 (越小越好)
-                        distance_to_bottom = space.z
-                        
-                        # 计算与其他货物的接触面积 (越大越好)
-                        neighbor_contact = self._calculate_neighbor_contact(position, cargo_dims)
-                        
-                        # 综合评分 (权重可调整)
-                        score = (
-                            10.0 * contact_area +  # 接触面积越大越好
-                            5.0 * neighbor_contact -  # 与其他货物接触面积越大越好
-                            0.1 * remaining_volume -  # 剩余空间越小越好
-                            1.0 * distance_to_boundary -  # 越靠近区域边界越好
-                            2.0 * distance_to_bottom  # 越靠近底部越好
-                        )
-                        
-                        if score > best_score:
-                            best_score = score
-                            best_space = space
-                            best_orientation = orientation
-                            best_position = position
+                        # 在粗搜索点周围进行精细搜索
+                        for dx in range(-int(coarse_step//2), int(coarse_step//2 + 1), int(fine_step)):
+                            for dy in range(-int(coarse_step//2), int(coarse_step//2 + 1), int(fine_step)):
+                                x_pos = base_x + dx
+                                y_pos = base_y + dy
+                                
+                                # 边界检查
+                                if (x_pos < space.x or 
+                                    y_pos < space.y or
+                                    x_pos + cargo_dims[0] > space.x + space.length or
+                                    y_pos + cargo_dims[1] > space.y + space.width):
+                                    continue
+                                    
+                                position = (x_pos, y_pos, base_z)
+                                position_counter += 1
+                                
+                                # 检查是否与已有货物重叠
+                                if self.container.check_overlap(position, cargo_dims):
+                                    continue
+                                    
+                                # 检查是否满足摆放规则
+                                if not self.container.check_placement_rules(position, orientation, cargo_dims[2]):
+                                    continue
+                                    
+                                # 完整评分计算
+                                contact_area = cargo.get_contact_area(orientation)
+                                remaining_volume = space.volume - cargo_dims[0] * cargo_dims[1] * cargo_dims[2]
+                                distance_to_boundary = min(
+                                    abs(x_pos - supplier.boundary_start),
+                                    abs(x_pos + cargo_dims[0] - supplier.boundary_end)
+                                )
+                                distance_to_bottom = space.z
+                                neighbor_contact = self._calculate_neighbor_contact(position, cargo_dims)
+                                
+                                score = (
+                                    10.0 * contact_area + 
+                                    5.0 * neighbor_contact - 
+                                    0.1 * remaining_volume - 
+                                    1.0 * distance_to_boundary - 
+                                    2.0 * distance_to_bottom
+                                )
+                                
+                                if score > best_score:
+                                    best_score = score
+                                    best_space = space
+                                    best_orientation = orientation
+                                    best_position = position
+        
+        # 输出总结信息
+        print(f"    搜索完成: 检查了 {space_counter}/{total_spaces} 空间, {position_counter} 个位置")
         
         # 如果找到最佳位置，放置货物
         if best_space and best_orientation is not None and best_position is not None:
+            print(f"    成功放置货物 {cargo.id} 在位置 {best_position}, 方向: {best_orientation}")
             return self.container.place_cargo(cargo, best_position, best_orientation)
         
+        print(f"    无法放置货物 {cargo.id}")
         return False
     
     def check_orientation_rules(self, orientation: int, z_position: int) -> bool:
@@ -670,8 +782,8 @@ class LoadingOptimizer:
                         continue
                     
                     # 尝试不同的放置位置
-                    for x_pos in range(space.x, space.x + space.length - int(cargo_dims[0]) + 1, max(1, GRID_SIZE)):
-                        for y_pos in range(space.y, space.y + space.width - int(cargo_dims[1]) + 1, max(1, GRID_SIZE)):
+                    for x_pos in range(int(space.x), int(space.x + space.length - cargo_dims[0] + 1), int(max(1, GRID_SIZE))):
+                        for y_pos in range(int(space.y), int(space.y + space.width - cargo_dims[1] + 1), int(max(1, GRID_SIZE))):
                             position = (x_pos, y_pos, space.z)
                             
                             # 检查是否与已有货物重叠
@@ -694,9 +806,9 @@ class LoadingOptimizer:
                             
                             # 综合评分 (权重可调整)
                             score = (
-                                10.0 * contact_area +  # 接触面积越大越好
-                                5.0 * neighbor_contact -  # 与其他货物接触面积越大越好
-                                0.1 * remaining_volume -  # 剩余空间越小越好
+                                10.0 * contact_area + 
+                                5.0 * neighbor_contact - 
+                                0.1 * remaining_volume - 
                                 2.0 * distance_to_bottom  # 越靠近底部越好
                             )
                             
