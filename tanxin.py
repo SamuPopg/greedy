@@ -179,21 +179,73 @@ class Container:
         if z == 0 and orientation < 2:  # 立放
             return False
         
-        # 规则2: 放宽对立放的限制，只要下方有足够支撑即可
+        # 规则2: 严格检查立放条件 - 如果是立放，必须有至少2层货物支撑
         if orientation < 2:  # 立放
-            # 计算底面积
+            # 获取货物底面尺寸（根据orientation计算）
             if orientation == 0:  # 立放1
-                bottom_area = height * height  # 简化计算，实际应该从货物获取正确尺寸
+                length_bottom = height  # 这里用参数替代，而不是从cargo对象获取
+                width_bottom = height
             else:  # 立放2
-                bottom_area = height * height  # 简化计算，实际应该从货物获取正确尺寸
+                length_bottom = height
+                width_bottom = height
             
-            # 检查下方是否有足够支撑 (至少60%的底面积有支撑)
-            supported_area = self._calculate_supported_area(x, y, z, height, height)
+            # 计算下方存在的层数
+            layers_below = self._count_layers_below(x, y, z, length_bottom, width_bottom)
+            if layers_below < 2:
+                return False
             
-            if supported_area < 0.6 * bottom_area:  # 降低支撑面积要求
+            # 仍然保留支撑面积检查
+            bottom_area = length_bottom * width_bottom
+            supported_area = self._calculate_supported_area(x, y, z, length_bottom, width_bottom)
+            
+            if supported_area < 0.6 * bottom_area:
                 return False
         
         return True
+    
+    def _count_layers_below(self, x: int, y: int, z: int, length: float, width: float) -> int:
+        """计算下方存在多少层货物"""
+        if z == 0:
+            return 0
+        
+        # 将实际尺寸转换为网格单元数
+        l_grid = int(np.ceil(length / GRID_SIZE))
+        w_grid = int(np.ceil(width / GRID_SIZE))
+        
+        # 检查点
+        x_grid = int(x // GRID_SIZE)
+        y_grid = int(y // GRID_SIZE)
+        
+        # 从下往上检查，找出不同的层
+        layers = set()
+        max_z_to_check = int(z // GRID_SIZE)
+        
+        # 在底面区域内采样检查点
+        for dx in range(0, l_grid, max(1, l_grid//5)):  # 采样点以减少计算量
+            for dy in range(0, w_grid, max(1, w_grid//5)):
+                nx = x_grid + dx
+                ny = y_grid + dy
+                
+                # 从下往上查找占用的网格点
+                for nz in range(0, max_z_to_check):
+                    if (0 <= nx < self.grid.shape[0] and 
+                        0 <= ny < self.grid.shape[1] and 
+                        0 <= nz < self.grid.shape[2] and
+                        self.grid[nx, ny, nz] > 0):
+                        # 找到占用点，记录该层
+                        for loaded_cargo in self.loaded_cargos:
+                            cargo_x, cargo_y, cargo_z = loaded_cargo.position
+                            cargo_dims = loaded_cargo.get_dimensions(loaded_cargo.orientation)
+                            cargo_top = cargo_z + cargo_dims[2]
+                            
+                            # 检查该点是否在这个货物的顶部
+                            if (cargo_x <= nx * GRID_SIZE < cargo_x + cargo_dims[0] and
+                                cargo_y <= ny * GRID_SIZE < cargo_y + cargo_dims[1] and
+                                (cargo_z + cargo_dims[2] - 1) <= nz * GRID_SIZE < cargo_z + cargo_dims[2] + 1):
+                                layers.add(cargo_top)
+                                break
+        
+        return len(layers)
     
     def update_available_spaces(self, position: Tuple[int, int, int], dimensions: Tuple[float, float, float]):
         """更高效的空间分割算法"""
@@ -391,25 +443,35 @@ class LoadingOptimizer:
             print(f"  正在装载供应商 {supplier.id} ({i+1}/{len(self.supplier_order)}) - "
                   f"货物数量: {len(supplier.cargo_list)} 件")
             
-            # 使用tqdm创建进度条
-            cargo_list = sorted(supplier.cargo_list, key=lambda c: c.volume, reverse=True)
-            with tqdm(total=len(cargo_list), desc=f"  {supplier.id} 装载进度") as pbar:
+            # 按尺寸相似性对货物进行分组，而不只是按体积排序
+            print("  对货物进行尺寸相似性分组...")
+            cargo_groups = self._group_cargos_by_similarity(supplier.cargo_list)
+            
+            # 使用tqdm创建总进度条
+            with tqdm(total=len(supplier.cargo_list), desc=f"  {supplier.id} 装载进度") as pbar:
                 loaded_count = 0
-                for cargo in cargo_list:
-                    # 尝试放置货物
-                    if self.place_cargo_in_zone(cargo, supplier):
-                        loaded_count += 1
-                        self.progress_stats["loaded_cargos"] += 1
-                    else:
-                        # 如果无法放置，添加到未装载列表
-                        self.unloaded_cargos.append(cargo)
+                
+                # 逐组处理货物（先处理大组）
+                for group in sorted(cargo_groups, key=lambda g: sum(c.volume for c in g), reverse=True):
+                    print(f"    处理货物组，数量：{len(group)}, 平均体积: {sum(c.volume for c in group)/len(group):.2f}")
                     
-                    # 更新进度条
-                    pbar.update(1)
-                    
-                    # 每装载10件货物显示一次当前状态
-                    if loaded_count % 10 == 0 and loaded_count > 0:
-                        self._display_current_status()
+                    # 组内按体积降序排序
+                    group_cargos = sorted(group, key=lambda c: c.volume, reverse=True)
+                    for cargo in group_cargos:
+                        # 尝试放置货物
+                        if self.place_cargo_in_zone(cargo, supplier):
+                            loaded_count += 1
+                            self.progress_stats["loaded_cargos"] += 1
+                        else:
+                            # 如果无法放置，添加到未装载列表
+                            self.unloaded_cargos.append(cargo)
+                        
+                        # 更新进度条
+                        pbar.update(1)
+                        
+                        # 每装载10件货物显示一次当前状态
+                        if loaded_count % 10 == 0 and loaded_count > 0:
+                            self._display_current_status()
             
             # 显示该供应商装载结果
             print(f"  供应商 {supplier.id} 装载完成: {loaded_count}/{len(supplier.cargo_list)} 件 "
@@ -524,9 +586,28 @@ class LoadingOptimizer:
         best_orientation = None
         best_position = None
         
+        # 按照"从内到外、从下到上"的策略对空间排序
+        # 1. 首先按Z坐标（高度）升序排序
+        # 2. 然后按到供应商区域内部的距离排序（区域中心优先）
+        zone_center_x = (supplier.boundary_start + supplier.boundary_end) / 2
+        
+        # 计算到区域中心的距离和高度的组合分数
+        for space in zone_spaces:
+            # 计算空间中心点到区域中心的距离
+            space_center_x = space.x + space.length / 2
+            distance_to_center = abs(space_center_x - zone_center_x)
+            
+            # 赋予空间一个排序优先级分数（越小越优先）
+            # 高度权重为1，距离中心权重为0.5
+            space.priority_score = space.z + 0.5 * distance_to_center / CONTAINER_LENGTH
+        
+        # 根据优先级排序空间（低分值优先）
+        zone_spaces.sort(key=lambda s: getattr(s, 'priority_score', float('inf')))
+        
+        print(f"    按照从内到外、从下到上策略对{len(zone_spaces)}个空间排序完成")
+        
         # 根据体积对空间排序（优先尝试大小合适的空间）
         cargo_volume = cargo.volume
-        zone_spaces.sort(key=lambda s: abs(s.volume - cargo_volume))
         
         for space in zone_spaces:
             space_counter += 1
@@ -582,20 +663,24 @@ class LoadingOptimizer:
                     # 计算评分因素
                     contact_area = cargo.get_contact_area(orientation)
                     remaining_volume = space.volume - cargo_dims[0] * cargo_dims[1] * cargo_dims[2]
-                    distance_to_boundary = min(
-                        abs(x_pos - supplier.boundary_start),
-                        abs(x_pos + cargo_dims[0] - supplier.boundary_end)
-                    )
+                    
+                    # 计算到区域中心的距离（越小越好）
+                    position_center_x = x_pos + cargo_dims[0] / 2
+                    distance_to_center = abs(position_center_x - zone_center_x)
+                    
+                    # 计算到底部的距离（越小越好）
                     distance_to_bottom = space.z
+                    
+                    # 计算与相邻货物的接触面积（越大越好）
                     neighbor_contact = self._calculate_neighbor_contact(position, cargo_dims)
                     
-                    # 计算评分
+                    # 修改评分函数，更强调从内到外、从下到上的策略
                     score = (
                         10.0 * contact_area + 
                         5.0 * neighbor_contact - 
                         0.1 * remaining_volume - 
-                        1.0 * distance_to_boundary - 
-                        2.0 * distance_to_bottom
+                        3.0 * distance_to_center / CONTAINER_LENGTH -  # 增大中心距离的权重
+                        5.0 * distance_to_bottom / CONTAINER_HEIGHT  # 增大底部距离的权重
                     )
                     
                     if score > best_score:
@@ -610,7 +695,31 @@ class LoadingOptimizer:
                     coarse_step = max(10, GRID_SIZE * 5)  # 粗搜索步长
                     potential_positions = []
                     
-                    for x_pos in range(int(space.x), int(space.x + space.length - cargo_dims[0] + 1), int(coarse_step)):
+                    # 从内到外搜索
+                    # 确定搜索顺序：从中心向两侧扩展
+                    space_center_x = space.x + space.length / 2
+                    search_width = min(space.length, cargo_dims[0] * 3)  # 限制搜索范围
+                    
+                    # 计算搜索起始点（从空间中心向两侧扩展）
+                    start_x = max(space.x, space_center_x - search_width/2)
+                    end_x = min(space.x + space.length - cargo_dims[0], space_center_x + search_width/2)
+                    
+                    # 生成从中心向外的x坐标序列
+                    x_positions = []
+                    step = int(coarse_step)
+                    center_x = (start_x + end_x) / 2
+                    
+                    # 从中心向外的位置序列
+                    offset = 0
+                    while center_x - offset >= start_x or center_x + offset <= end_x:
+                        if center_x - offset >= start_x:
+                            x_positions.append(int(center_x - offset))
+                        if offset > 0 and center_x + offset <= end_x:
+                            x_positions.append(int(center_x + offset))
+                        offset += step
+                    
+                    # 使用生成的x坐标序列进行搜索
+                    for x_pos in x_positions:
                         for y_pos in range(int(space.y), int(space.y + space.width - cargo_dims[1] + 1), int(coarse_step)):
                             position = (x_pos, y_pos, space.z)
                             position_counter += 1
@@ -618,8 +727,10 @@ class LoadingOptimizer:
                             # 基础检查
                             if not self.container.check_overlap(position, cargo_dims) and \
                                self.container.check_placement_rules(position, orientation, cargo_dims[2]):
-                                # 简化评分计算
-                                quick_score = cargo.get_contact_area(orientation) - 2.0 * space.z
+                                # 计算评分，考虑到内部优先
+                                position_center_x = x_pos + cargo_dims[0] / 2
+                                distance_to_center = abs(position_center_x - zone_center_x)
+                                quick_score = cargo.get_contact_area(orientation) - 2.0 * space.z - distance_to_center / 10
                                 potential_positions.append((position, quick_score))
                     
                     # 对有潜力的位置进行排序并选择前N个进行精细搜索
@@ -658,19 +769,24 @@ class LoadingOptimizer:
                                 # 完整评分计算
                                 contact_area = cargo.get_contact_area(orientation)
                                 remaining_volume = space.volume - cargo_dims[0] * cargo_dims[1] * cargo_dims[2]
-                                distance_to_boundary = min(
-                                    abs(x_pos - supplier.boundary_start),
-                                    abs(x_pos + cargo_dims[0] - supplier.boundary_end)
-                                )
+                                
+                                # 计算到区域中心的距离（越小越好）
+                                position_center_x = x_pos + cargo_dims[0] / 2
+                                distance_to_center = abs(position_center_x - zone_center_x)
+                                
+                                # 计算到底部的距离（越小越好）
                                 distance_to_bottom = space.z
+                                
+                                # 计算与相邻货物的接触面积（越大越好）
                                 neighbor_contact = self._calculate_neighbor_contact(position, cargo_dims)
                                 
+                                # 更新评分函数，更强调内部优先和底部优先
                                 score = (
                                     10.0 * contact_area + 
                                     5.0 * neighbor_contact - 
                                     0.1 * remaining_volume - 
-                                    1.0 * distance_to_boundary - 
-                                    2.0 * distance_to_bottom
+                                    3.0 * distance_to_center / CONTAINER_LENGTH -  # 增大中心距离的权重
+                                    5.0 * distance_to_bottom / CONTAINER_HEIGHT  # 增大底部距离的权重
                                 )
                                 
                                 if score > best_score:
@@ -1012,6 +1128,67 @@ class LoadingOptimizer:
             ]
         }
         return plan
+    
+    def _calculate_similarity(self, cargo1: Cargo, cargo2: Cargo) -> float:
+        """计算两个货物之间的尺寸相似性"""
+        # 提取两个货物的尺寸，并按从大到小排序
+        dims1 = sorted([cargo1.length, cargo1.width, cargo1.height], reverse=True)
+        dims2 = sorted([cargo2.length, cargo2.width, cargo2.height], reverse=True)
+        
+        # 计算各个维度的相对差异
+        diff_l = abs(dims1[0] - dims2[0]) / max(dims1[0], dims2[0])
+        diff_w = abs(dims1[1] - dims2[1]) / max(dims1[1], dims2[1])
+        diff_h = abs(dims1[2] - dims2[2]) / max(dims1[2], dims2[2])
+        
+        # 综合差异指标（越小表示越相似）
+        similarity_score = (diff_l + diff_w + diff_h) / 3
+        
+        # 返回相似度（0-1范围，越大越相似）
+        return 1 - similarity_score
+    
+    def _group_cargos_by_similarity(self, cargo_list: List[Cargo]) -> List[List[Cargo]]:
+        """根据尺寸相似性对货物分组"""
+        if len(cargo_list) <= 1:
+            return [cargo_list]
+        
+        # 计算所有货物对之间的相似度
+        print("    计算货物相似度矩阵...")
+        similarity_threshold = 0.8  # 相似度阈值，可调整
+        groups = []
+        remaining_cargos = set(cargo_list)
+        
+        # 从最大的货物开始作为种子形成组
+        sorted_cargos = sorted(cargo_list, key=lambda c: c.volume, reverse=True)
+        
+        while remaining_cargos:
+            # 从未分组的货物中取出一个作为新组的种子
+            seed_cargo = sorted_cargos[0] if sorted_cargos and sorted_cargos[0] in remaining_cargos else next(iter(remaining_cargos))
+            new_group = [seed_cargo]
+            remaining_cargos.remove(seed_cargo)
+            sorted_cargos = [c for c in sorted_cargos if c != seed_cargo]
+            
+            # 找出与种子货物相似的其他货物
+            similar_cargos = []
+            for cargo in sorted_cargos:
+                if cargo not in remaining_cargos:
+                    continue
+                    
+                similarity = self._calculate_similarity(seed_cargo, cargo)
+                if similarity >= similarity_threshold:
+                    similar_cargos.append((cargo, similarity))
+            
+            # 按相似度排序并添加到当前组
+            similar_cargos.sort(key=lambda x: x[1], reverse=True)
+            for cargo, _ in similar_cargos[:min(20, len(similar_cargos))]:  # 限制每组最多20个相似货物
+                if cargo in remaining_cargos:  # 确保货物还未被分配
+                    new_group.append(cargo)
+                    remaining_cargos.remove(cargo)
+                    sorted_cargos.remove(cargo)
+            
+            groups.append(new_group)
+        
+        print(f"    分组完成，共形成 {len(groups)} 个货物组")
+        return groups
 
 def load_cargo_data(file_path: str) -> Tuple[List[Supplier], Dict[str, List[Cargo]]]:
     """
