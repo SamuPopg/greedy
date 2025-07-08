@@ -1,766 +1,893 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-集装箱装载优化器 - 基于供应商顺序的分区装载策略
-实现第一优先级模块：区域规划、垂直分层策略、基础空间管理
-"""
-
 import math
-from typing import List, Dict, Tuple, Optional, Any
-from dataclasses import dataclass
-from enum import Enum
 import time
-
+import random
+import copy
+import pandas as pd
+import numpy as np
+import re
+from typing import List, Tuple, Set
+from dataclasses import dataclass, field
+from enum import Enum
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
 
 class PlacementType(Enum):
-    """货物摆放方式枚举"""
-    STANDING_1 = "立放1"  # 宽度*长度的面为底面，长度*高度的面为正面
-    STANDING_2 = "立放2"  # 宽度*长度的面为底面，宽度*高度的面为正面
-    SIDE_1 = "侧放1"      # 高度*长度的面为底面，长度*宽度的面为正面
-    SIDE_2 = "侧放2"      # 高度*长度的面为底面，高度*宽度的面为正面
-    LYING_1 = "躺放1"     # 宽度*高度的面为底面，高度*长度的面为正面
-    LYING_2 = "躺放2"     # 宽度*高度的面为底面，宽度*长度的面为正面
+    """定义货物的六种摆放方式"""
+    UPRIGHT_X = '立放1'
+    UPRIGHT_Y = '立放2'
+    SIDE_LYING_X = '侧放1'
+    SIDE_LYING_Y = '侧放2'
+    LYING_X = '躺放1'
+    LYING_Y = '躺放2'
 
+    def __hash__(self):
+        return id(self)
 
 @dataclass
-class Cargo:
-    """货物信息类"""
-    cargoId: str           # 货物ID
-    supplier: str          # 供应商
-    length: float          # 长度(cm)
-    width: float           # 宽度(cm)  
-    height: float          # 高度(cm)
-    weight: float          # 重量(kg)
-    quantity: int          # 数量
-    
-    @property
-    def volume(self) -> float:
-        """计算货物体积"""
-        return self.length * self.width * self.height
-    
-    @property
-    def availablePlacements(self) -> List[PlacementType]:
-        """返回所有可用的摆放方式"""
-        return list(PlacementType)
-
-    def getDimensionsForPlacement(self, placementType: PlacementType) -> Tuple[float, float, float]:
-        """根据摆放方式获取货物在空间中的尺寸(长,宽,高)"""
-        try:
-            if placementType == PlacementType.STANDING_1:
-                # 立放1：长×宽×高（原始尺寸）
-                return (self.length, self.width, self.height)
-            elif placementType == PlacementType.STANDING_2:
-                # 立放2：宽×长×高（长宽交换）
-                return (self.width, self.length, self.height)
-            elif placementType == PlacementType.SIDE_1:
-                # 侧放1：长×高×宽（高度变成宽度方向）
-                return (self.length, self.height, self.width)
-            elif placementType == PlacementType.SIDE_2:
-                # 侧放2：高×长×宽（长度变成宽度方向）
-                return (self.height, self.length, self.width)
-            elif placementType == PlacementType.LYING_1:
-                # 躺放1：宽×高×长（长度变成高度）
-                return (self.width, self.height, self.length)
-            elif placementType == PlacementType.LYING_2:
-                # 躺放2：高×宽×长（长度变成高度，长宽交换）
-                return (self.height, self.width, self.length)
-            else:
-                raise ValueError(f"不支持的摆放方式: {placementType}")
-        except Exception as e:
-            print(f"计算货物尺寸时发生错误: {e}")
-            return (self.length, self.width, self.height)
-
-
-@dataclass(frozen=True)
 class Position:
-    """三维位置信息"""
-    x: float  # X坐标(cm)
-    y: float  # Y坐标(cm)
-    z: float  # Z坐标(cm)
+    """代表一个三维空间中的坐标点。"""
+    x: float
+    y: float
+    z: float
 
+    def __eq__(self, other):
+        return isinstance(other, Position) and self.x == other.x and self.y == other.y and self.z == other.z
 
-@dataclass
-class LoadedItem:
-    """用于记录已放置货物信息的数据类。"""
-    cargo: Cargo
-    position: Position
-    placement_type: PlacementType
+    def __hash__(self):
+        return hash((self.x, self.y, self.z))
 
+class Cargo:
+    """代表一件货物及其所有属性和状态"""
+    def __init__(self, cargo_id: str, supplier: str, length: float, width: float, height: float, weight: float):
+        self.cargo_id = cargo_id
+        self.supplier = supplier
+        self.original_dims = (length, width, height)
+        self.length = length
+        self.width = width
+        self.height = height
+        self.weight = weight
+        self.volume = length * width * height
+        self.current_orientation: PlacementType = None
 
-@dataclass
-class Region:
-    """定义一个集装箱内的物理区域"""
-    startPosition: float
-    endPosition: float
-    width: float
-    height: float
-    supplier: str
+    def set_orientation(self, placement_type: PlacementType):
+        """根据摆放方式，更新货物的长宽高"""
+        original_l, original_w, original_h = self.original_dims
+        self.current_orientation = placement_type
 
-    @property
-    def volume(self) -> float:
-        """计算区域体积"""
-        return (self.endPosition - self.startPosition) * self.width * self.height
+        if placement_type == PlacementType.UPRIGHT_X:
+            self.length, self.width, self.height = original_l, original_w, original_h
+        elif placement_type == PlacementType.UPRIGHT_Y:
+            self.length, self.width, self.height = original_w, original_l, original_h
+        elif placement_type == PlacementType.SIDE_LYING_X:
+            self.length, self.width, self.height = original_l, original_h, original_w
+        elif placement_type == PlacementType.SIDE_LYING_Y:
+            self.length, self.width, self.height = original_h, original_l, original_w
+        elif placement_type == PlacementType.LYING_X:
+            self.length, self.width, self.height = original_w, original_h, original_l
+        elif placement_type == PlacementType.LYING_Y:
+            self.length, self.width, self.height = original_h, original_w, original_l
 
-    def __repr__(self) -> str:
-        return f"区域(供应商: {self.supplier}, X: {self.startPosition:.1f}-{self.endPosition:.1f}, 体积: {self.volume:.2f}cm³)"
+    def __eq__(self, other):
+        if not isinstance(other, Cargo):
+            return False
+        return id(self) == id(other)
 
+    def __hash__(self):
+        return id(self)
+        
+class PlacedItem:
+    """代表一个已经放置在容器中的货物"""
+    def __init__(self, cargo: Cargo, position: Position, orientation: PlacementType):
+        self.cargo = cargo
+        self.position = position
+        self.orientation = orientation
+        # 立即计算并缓存当前尺寸，避免重复计算
+        temp_cargo = copy.copy(self.cargo)
+        temp_cargo.set_orientation(self.orientation)
+        self.current_dims = (temp_cargo.length, temp_cargo.width, temp_cargo.height)
+    
+    def __eq__(self, other):
+        return isinstance(other, PlacedItem) and self.cargo == other.cargo and self.position == other.position and self.orientation == other.orientation
+
+class PackingSolution:
+    """代表一个完整的装载方案（状态），不再依赖SpaceManager"""
+    def __init__(self, all_cargo: List[Cargo]):
+        self.placed_items: List[PlacedItem] = []
+        self.unloaded_cargo_set: Set[Cargo] = set(all_cargo)
+        self.total_volume = 0.0
+
+    def add_item(self, cargo_to_add: Cargo, position: Position, orientation: PlacementType):
+        """向方案中添加一个新放置的货物"""
+        new_item = PlacedItem(cargo_to_add, position, orientation)
+        self.placed_items.append(new_item)
+        self.total_volume += cargo_to_add.volume
+        
+        if cargo_to_add in self.unloaded_cargo_set:
+            self.unloaded_cargo_set.remove(cargo_to_add)
+
+    def remove_item(self, item_to_remove: PlacedItem):
+        """从方案中移除一个已放置的货物"""
+        self.placed_items.remove(item_to_remove)
+        self.unloaded_cargo_set.add(item_to_remove.cargo)
+        self.total_volume -= item_to_remove.cargo.volume
+
+    def copy(self) -> 'PackingSolution':
+        """创建一个当前解的浅拷贝，用于快速生成邻居解"""
+        new_solution = PackingSolution([])
+        new_solution.placed_items = self.placed_items[:]
+        new_solution.total_volume = self.total_volume
+        new_solution.unloaded_cargo_set = self.unloaded_cargo_set.copy()
+        return new_solution
+
+class SupplierRegion:
+    """定义一个供应商的装载区域"""
+    def __init__(self, name: str, start_position: float, end_position: float):
+        self.name = name
+        self.start_position = start_position
+        self.end_position = end_position
+
+    def is_inside(self, item_start_x: float, item_end_x: float) -> bool:
+        """检查一个物品是否完全位于该区域内"""
+        return self.start_position <= item_start_x and item_end_x <= self.end_position
 
 @dataclass
 class LayerInfo:
-    """分层信息"""
-    layerIndex: int        # 层索引(0为底层)
-    startHeight: float     # 层起始高度
-    endHeight: float       # 层结束高度
-    
-    @property
-    def height(self) -> float:
-        """计算层高度"""
-        return self.endHeight - self.startHeight
-
-
-class RegionPlanner:
-    """区域规划模块 - 负责根据供应商顺序和货物体积分配区域"""
-    
-    def __init__(self, containerDimensions: Tuple[float, float, float]):
-        """
-        初始化区域规划器
-        
-        Args:
-            containerDimensions: 集装箱尺寸(长,宽,高)
-        """
-        self.containerLength = containerDimensions[0]
-        self.containerWidth = containerDimensions[1]
-        self.containerHeight = containerDimensions[2]
-        self.interactionZoneRatio = 0.05  # 交接区预留比例
-        
-    def calculateSupplierVolumes(self, supplierSequence: List[str], cargoData: Dict[str, List[Cargo]]) -> Dict[str, float]:
-        """
-        计算各供应商的货物总体积
-        
-        Args:
-            supplierSequence: 供应商访问顺序
-            cargoData: 货物数据，按供应商分组
-            
-        Returns:
-            各供应商的总体积字典
-        """
-        try:
-            supplierVolumes = {}
-            for supplier in supplierSequence:
-                if supplier in cargoData:
-                    totalVolume = 0
-                    for cargo in cargoData[supplier]:
-                        totalVolume += cargo.volume * cargo.quantity
-                    supplierVolumes[supplier] = totalVolume
-                else:
-                    print(f"警告: 供应商 {supplier} 没有货物数据")
-                    supplierVolumes[supplier] = 0
-            return supplierVolumes
-        except Exception as e:
-            print(f"计算供应商体积时发生错误: {e}")
-            return {}
-    
-    def calculateRegionBoundaries(self, supplierSequence: List[str], cargoData: Dict[str, List[Cargo]]) -> List[Region]:
-        """
-        计算各供应商区域边界
-        
-        Args:
-            supplierSequence: 供应商访问顺序
-            cargoData: 货物数据，按供应商分组
-            
-        Returns:
-            供应商区域列表
-        """
-        try:
-            # 1. 计算各供应商总体积
-            supplierVolumes = self.calculateSupplierVolumes(supplierSequence, cargoData)
-            
-            # 2. 计算体积比例
-            totalVolume = sum(supplierVolumes.values())
-            if totalVolume == 0:
-                raise ValueError("总体积为0，无法分配区域")
-            
-            volumeRatios = {supplier: volume / totalVolume for supplier, volume in supplierVolumes.items()}
-            
-            # 3. 预留交接区空间
-            availableLength = self.containerLength * (1 - self.interactionZoneRatio)
-            
-            # 4. 按供应商顺序从内到外分配区域
-            regions = []
-            currentPosition = 0
-            
-            for supplier in supplierSequence:
-                regionLength = availableLength * volumeRatios[supplier]
-                
-                region = Region(
-                    startPosition=currentPosition,
-                    endPosition=currentPosition + regionLength,
-                    width=self.containerWidth,
-                    height=self.containerHeight,
-                    supplier=supplier
-                )
-                
-                regions.append(region)
-                currentPosition += regionLength
-                
-                print(f"供应商 {supplier} 分配区域: {currentPosition-regionLength:.1f}cm - {currentPosition:.1f}cm, 体积比例: {volumeRatios[supplier]:.3f}")
-            
-            return regions
-            
-        except Exception as e:
-            print(f"计算区域边界时发生错误: {e}")
-            return []
-    
-    def calculateInteractionZones(self, regions: List[Region]) -> List[Dict[str, Any]]:
-        """
-        计算交接区边界
-        
-        Args:
-            regions: 供应商区域列表
-            
-        Returns:
-            交接区信息列表
-        """
-        try:
-            interactionZones = []
-            interactionZoneWidth = self.containerLength * self.interactionZoneRatio / max(1, len(regions) - 1)
-            
-            for i in range(len(regions) - 1):
-                zone = {
-                    'supplier1': regions[i].supplier,
-                    'supplier2': regions[i + 1].supplier,
-                    'startPosition': regions[i].endPosition - interactionZoneWidth / 2,
-                    'endPosition': regions[i + 1].startPosition + interactionZoneWidth / 2,
-                    'width': interactionZoneWidth,
-                    'height': self.containerHeight
-                }
-                interactionZones.append(zone)
-                
-                print(f"交接区 {zone['supplier1']}-{zone['supplier2']}: {zone['startPosition']:.1f}cm - {zone['endPosition']:.1f}cm")
-            
-            return interactionZones
-            
-        except Exception as e:
-            print(f"计算交接区时发生错误: {e}")
-            return []
-
+    """存储单层的信息"""
+    start_z: float
+    end_z: float
+    index: int
 
 class LayerStrategy:
-    """垂直分层策略 - 负责在每个供应商区域内实现垂直分层"""
-    
-    def __init__(self):
-        self.layers: List[LayerInfo] = []
+    """负责根据货物高度分布和物理约束，动态地决定容器的分层策略"""
+    def __init__(self, container_dims: Tuple[int, int, int], all_cargo: List[Cargo]):
+        self.container_height = container_dims[2]
+        self.layers = self._create_layers(all_cargo)
 
-    def redesign_layers(self, all_cargo: List[Cargo], container_height: float):
-        """
-        基于所有货物的尺寸分布，重新设计一个通用的、动态的三层分层策略。
-        """
-        # 1. 收集所有货物所有可能的非零高度
-        possible_heights = []
-        for cargo in all_cargo:
-            dims = [cargo.length, cargo.width, cargo.height]
-            possible_heights.extend([d for d in dims if d > 0])
-        
-        if not possible_heights:
-            print("警告: 无法收集到任何货物高度信息，无法进行分层。")
-            self.layers = []
-            return
+    def _create_layers(self, all_cargo: List[Cargo]) -> List[LayerInfo]:
+        """基于货物高度创建分层"""
+        if not all_cargo:
+            return [LayerInfo(0, self.container_height, 0)]
 
-        # 2. 基于高度分布设计层高
-        sorted_heights = sorted(list(set(possible_heights)))
+        sorted_heights = sorted(list(set(c.height for c in all_cargo)))
         
-        # 简单的策略：使用百分位来决定层高
-        p25 = sorted_heights[int(len(sorted_heights) * 0.25)]
-        p75 = sorted_heights[int(len(sorted_heights) * 0.75)]
-        
-        # 第1层高度，至少30cm，适应较小的货物
-        layer1_h = max(30, p25 + 5)
-        # 第2层高度，至少40cm，适应中等货物
-        layer2_h = max(40, p75 + 5)
-        
-        # 确保总高不超过容器高度
-        if layer1_h + layer2_h >= container_height:
-            layer1_h = container_height * 0.4
-            layer2_h = container_height * 0.6
-        
-        layer3_h = container_height - layer1_h - layer2_h
+        if len(sorted_heights) > 2:
+            h1 = sorted_heights[len(sorted_heights) // 3]
+            h2 = sorted_heights[len(sorted_heights) * 2 // 3]
+            
+            layer1_height = h1 + 1.0
+            layer2_height = h2 + 1.0
 
-        self.layers = [
-            LayerInfo(layerIndex=0, startHeight=0, endHeight=layer1_h),
-            LayerInfo(layerIndex=1, startHeight=layer1_h, endHeight=layer1_h + layer2_h),
-            LayerInfo(layerIndex=2, startHeight=layer1_h + layer2_h, endHeight=container_height)
-        ]
+            if layer1_height + layer2_height > self.container_height:
+                layer1_height = self.container_height / 3
+                layer2_height = self.container_height / 3
 
-    def get_layers(self) -> List[LayerInfo]:
-        return self.layers
-        
+            return [
+                LayerInfo(0, layer1_height, 0),
+                LayerInfo(layer1_height, layer1_height + layer2_height, 1),
+                LayerInfo(layer1_height + layer2_height, self.container_height, 2)
+            ]
+        else:
+            return [LayerInfo(0, self.container_height, 0)]
+
+    def get_layer_index(self, z: float) -> int:
+        for layer in self.layers:
+            if layer.start_z <= z < layer.end_z:
+                return layer.index
+        return -1
+
+    def get_allowed_placements(self, z_position: float) -> Set[PlacementType]:
+        layer_index = self.get_layer_index(z_position)
+        if layer_index in [0, 1]:
+            return {
+                PlacementType.SIDE_LYING_X, PlacementType.SIDE_LYING_Y,
+                PlacementType.LYING_X, PlacementType.LYING_Y
+            }
+        return set(PlacementType)
+
     def print_layers(self):
         print("\n=== 动态分层策略结果 ===")
-        if not self.layers:
-            print("  未生成任何分层。")
-            return
         for layer in self.layers:
-            print(f"  层 {layer.layerIndex + 1}: 高度 {layer.startHeight:.1f}cm - {layer.endHeight:.1f}cm (厚度: {layer.height:.1f}cm)")
+            print(f"  层 {layer.index + 1}: 高度 {layer.start_z:.1f}cm - {layer.end_z:.1f}cm (厚度: {layer.end_z - layer.start_z:.1f}cm)")
 
+class SortingStrategy(Enum):
+    """定义货物排序策略的枚举"""
+    VOLUME_DESC = '体积从大到小'
+    AREA_DESC = '最大底面积从大到小'
+    MAX_DIM_DESC = '最长边从大到小'
+    RANDOM_SHUFFLE = '随机打乱'
 
-class SpaceManager:
-    """空间管理器，负责跟踪集装箱内的空间占用情况。"""
-    def __init__(self, containerDimensions: Tuple[float, float, float], gridSize: float = 5.0):
-        self.containerDimensions = containerDimensions
-        self.gridSize = float(gridSize)
-        self.gridCount = (
-            int(containerDimensions[0] / self.gridSize),
-            int(containerDimensions[1] / self.gridSize),
-            int(containerDimensions[2] / self.gridSize)
-        )
-        self.occupiedCells: Set[Tuple[int, int, int]] = set()
-        print(f"空间管理器初始化完成: 网格数量 {self.gridCount[0]}x{self.gridCount[1]}x{self.gridCount[2]}, 网格尺寸 {self.gridSize}cm")
-
-    def reset(self):
-        """重置空间，清空所有已占用的网格。"""
-        self.occupiedCells.clear()
-        print("空间管理器已重置。")
-
-    def calculateOccupiedCells(self, position: Position, cargo: Cargo, placementType: PlacementType) -> List[Tuple[int, int, int]]:
-        """计算给定货物和位置将占用的所有网格单元。"""
-        try:
-            dims = cargo.getDimensionsForPlacement(placementType)
-            
-            startX = int(position.x / self.gridSize)
-            startY = int(position.y / self.gridSize)
-            startZ = int(position.z / self.gridSize)
-            
-            endX = int((position.x + dims[0]) / self.gridSize)
-            endY = int((position.y + dims[1]) / self.gridSize)
-            endZ = int((position.z + dims[2]) / self.gridSize)
-
-            cells = []
-            for x in range(startX, endX):
-                for y in range(startY, endY):
-                    for z in range(startZ, endZ):
-                        cells.append((x, y, z))
-            return cells
-        except Exception as e:
-            # 这里的 cargo 可能是元组，也可能是 Cargo 对象，需要统一
-            cargo_id = cargo.cargoId if hasattr(cargo, 'cargoId') else 'N/A'
-            print(f"计算网格占用时发生错误: {e}, Cargo ID: {cargo_id}")
-            return []
-
-    def isSpaceAvailable(self, position: Position, cargo: Cargo, placement_type: PlacementType) -> bool:
-        """检查给定位置是否有足够空间放置一个货物（使用精确的边界计算）。"""
-        dims = cargo.getDimensionsForPlacement(placement_type)
-
-        # 检查物理边界
-        if position.x + dims[0] > self.containerDimensions[0] or \
-           position.y + dims[1] > self.containerDimensions[1] or \
-           position.z + dims[2] > self.containerDimensions[2]:
-            return False
-
-        # 精确的网格坐标转换
-        start_x = int(position.x / self.gridSize)
-        end_x = int((position.x + dims[0] - 1e-9) / self.gridSize)
-        start_y = int(position.y / self.gridSize)
-        end_y = int((position.y + dims[1] - 1e-9) / self.gridSize)
-        start_z = int(position.z / self.gridSize)
-        end_z = int((position.z + dims[2] - 1e-9) / self.gridSize)
-
-        for x in range(start_x, end_x + 1):
-            for y in range(start_y, end_y + 1):
-                for z in range(start_z, end_z + 1):
-                    if (x, y, z) in self.occupiedCells:
-                        return False
-        return True
-
-    def markOccupied(self, position: Position, cargo: Cargo, placement_type: PlacementType):
-        """将货物占据的空间标记为已占用（使用精确的边界计算）。"""
-        dims = cargo.getDimensionsForPlacement(placement_type)
-        
-        start_x = int(position.x / self.gridSize)
-        end_x = int((position.x + dims[0] - 1e-9) / self.gridSize)
-        start_y = int(position.y / self.gridSize)
-        end_y = int((position.y + dims[1] - 1e-9) / self.gridSize)
-        start_z = int(position.z / self.gridSize)
-        end_z = int((position.z + dims[2] - 1e-9) / self.gridSize)
-
-        cells_to_occupy = set()
-        for x in range(start_x, end_x + 1):
-            for y in range(start_y, end_y + 1):
-                for z in range(start_z, end_z + 1):
-                    cells_to_occupy.add((x, y, z))
-        self.occupiedCells.update(cells_to_occupy)
-
-
-    def check_foundations(self, position: Position, dimensions: Tuple[float, float, float]) -> bool:
-        """
-        检查一个物体放置位置的地基是否稳固。
-        新策略：只需要检查物体的四个底面角点下方是否有支撑即可。
-        """
-        x, y, z = position.x, position.y, position.z
-        w, d, _ = dimensions
-
-        # 如果物体直接放在集装箱底部，地基总是稳固的
-        if z == 0:
-            return True
-
-        # 定义四个角点的x, y坐标
-        corners = [
-            (x, y),
-            (x + w, y),
-            (x, y + d),
-            (x + w, y + d)
-        ]
-
-        # 检查每个角点正下方一个单位(grid_size)的网格是否被占用
-        # 我们需要将物理坐标转换为网格坐标
-        target_z_grid = int((z / self.gridSize) - 1)
-        if target_z_grid < 0:
-            return False # 已经在最底层之下，理论上不会发生
-
-        for corner_x, corner_y in corners:
-            # -1epsilon 是为了处理边界情况，确保在地板上的点能被正确计算
-            gx = int((corner_x - 1e-9) / self.gridSize)
-            gy = int((corner_y - 1e-9) / self.gridSize)
-            
-            if (gx, gy, target_z_grid) not in self.occupiedCells:
-                # 只要有一个角点没有支撑，就认为地基不稳
-                return False
-        
-        # 所有角点都有支撑
-        return True
-
-
-class SupplierBasedContainerOptimizer:
+class GreedyContainerOptimizer:
     """
-    一个基于供应商分区和动态层策略的集装箱装载优化器。
+    基于贪心策略的集装箱优化器。
+    核心思想是构建一个高质量的初始解，并以此为最终结果，追求最快的计算速度。
     """
-    def __init__(self, container_dims: Tuple[float, float, float], grid_size: float = 1.0):
+    def __init__(self, container_dims: Tuple[int, int, int]):
         self.container_dims = container_dims
-        self.grid_size = grid_size
-        self.spaceManager = SpaceManager(container_dims, grid_size)
-        self.layerStrategy = LayerStrategy()
-        self.loadedItems: List[LoadedItem] = []
-        self.regions: List[Region] = []
+        self.all_cargo: List[Cargo] = []
+        self.regions: List[SupplierRegion] = []
+        self.layer_strategy: LayerStrategy = None
 
-    def _add_candidate_point(self, new_point: Position, region: Region, candidate_list: List[Position]):
-        """
-        验证并添加一个新的候选点到列表中，同时避免重复。
-        确保候选点在货柜和当前供应商区域的边界内。
-        """
-        # 1. 检查是否在货柜物理边界内
-        if not (0 <= new_point.x < self.container_dims[0] and
-                0 <= new_point.y < self.container_dims[1] and
-                0 <= new_point.z < self.container_dims[2]):
-            return
+    def _preprocess_cargo(self, cargo_data: List[dict]) -> List[Cargo]:
+        cargo_list = []
+        supplier_pattern = re.compile(r'（(.*?)）')
+        for item in cargo_data:
+            match = supplier_pattern.search(item.get('貨物名稱', ''))
+            supplier_name = match.group(1) if match else "UnknownSupplier"
+            for _ in range(int(item['數量'])):
+                cargo_list.append(Cargo(
+                    cargo_id=item.get('貨物名稱', 'Unknown'),
+                    supplier=supplier_name,
+                    length=item['長度'], width=item['寬度'], height=item['高度'], weight=item['重量']
+                ))
+        return cargo_list
 
-        # 2. 检查是否在当前供应商的X轴区域内
-        if not (region.startPosition <= new_point.x < region.endPosition):
-            return
-
-        # 3. 检查是否已存在，避免重复
-        if new_point not in candidate_list:
-            candidate_list.append(new_point)
-
-    def _get_allowed_placements(self, cargo: Cargo, layer: LayerInfo) -> List[PlacementType]:
-        """根据当前层数，决定货物允许的摆放方式。"""
-        possible_placements = list(cargo.availablePlacements)
-        if layer.layerIndex < 2:  # 对应第一层和第二层
-            # 移除所有立放的选项
-            possible_placements = [p for p in possible_placements if p not in [PlacementType.STANDING_1, PlacementType.STANDING_2]]
-        return possible_placements
-
-    def loadCargoInLayer(self, region: Region, layer: LayerInfo, cargo_list: List[Cargo], initial_points: List[Position]) -> int:
-        """
-        在指定的区域和层内，使用基于"角落"的三维候选点策略尝试放置一批货物。
-        这是算法的核心，它实现了动态生成和消耗候选点的逻辑。
-        """
-        sorted_cargo = sorted(cargo_list, key=lambda c: c.volume, reverse=True)
-        loaded_count = 0
-
-        # 1. 初始化候选点列表，使用传入的初始点，并确保默认起点存在
-        candidate_points = list(set(initial_points)) # 使用set去重
-        # 确保该区域在本层的默认起点始终存在
-        default_start_point = Position(region.startPosition, 0, layer.startHeight)
-        if default_start_point not in candidate_points:
-            candidate_points.append(default_start_point)
-
-        # 范式转移：算法的"主角"从"货物"变为"候选点"
-        while candidate_points:
-            # 1. 选取并移除当前最优的候选点
-            candidate_points.sort(key=lambda p: (p.z, p.y, p.x))
-            current_point = candidate_points.pop(0)
-
-            best_fit_cargo = None
-            best_fit_placement = None
-            # 使用一个评分来记录最优选择，例如，最大化体积
-            best_score = -1
-
-            # 2. 遍历所有"未放置"且"适合本层"的货物，为这一个"坑"找到最合适的"萝卜"
-            for cargo in cargo_list:
-                if cargo in [item.cargo for item in self.loadedItems]:
-                    continue # 跳过已放置的
-
-                for placement_type in self._get_allowed_placements(cargo, layer):
-                    dims = cargo.getDimensionsForPlacement(placement_type)
-                    if current_point.z + dims[2] > layer.startHeight + layer.height:
-                        continue
-
-                    if self.spaceManager.isSpaceAvailable(current_point, cargo, placement_type) and \
-                       self.spaceManager.check_foundations(current_point, dims):
-                        
-                        # 启发式评分: 在这个点上，优先放置可行的、体积最大的货物
-                        score = cargo.volume
-                        if score > best_score:
-                            best_score = score
-                            best_fit_cargo = cargo
-                            best_fit_placement = placement_type
-            
-            # 4. 如果为这个点找到了最适合的货物，就放置它
-            if best_fit_cargo:
-                dims = best_fit_cargo.getDimensionsForPlacement(best_fit_placement)
-                self.spaceManager.markOccupied(current_point, best_fit_cargo, best_fit_placement)
-                self.loadedItems.append(LoadedItem(best_fit_cargo, current_point, best_fit_placement))
-                print(f"      在点 {current_point} 成功放置最适货物 {best_fit_cargo.cargoId}。")
-                
-                # 放置成功后，生成新的候选点并加入列表
-                new_point_top = Position(current_point.x, current_point.y, current_point.z + dims[2])
-                new_point_x = Position(current_point.x + dims[0], current_point.y, current_point.z)
-                new_point_y = Position(current_point.x, current_point.y + dims[1], current_point.z)
-                
-                self._add_candidate_point(new_point_top, region, candidate_points)
-                self._add_candidate_point(new_point_x, region, candidate_points)
-                self._add_candidate_point(new_point_y, region, candidate_points)
-                
-                loaded_count += 1
-        
-        return loaded_count
-
-    def optimize(self, cargo_data: Dict[str, List[Cargo]], suppliers_sequence: List[str]):
-        """
-        主优化流程。
-        """
-        self.spaceManager.reset()
-        self.loadedItems = []
-        
-        # 1. 动态区域划分
-        self.regions = self.calculate_regions(cargo_data, suppliers_sequence)
-        
-        # 2. 动态分层策略
-        all_cargo_list = [cargo for sublist in cargo_data.values() for cargo in sublist]
-        self.layerStrategy.redesign_layers(all_cargo_list, self.container_dims[2])
-        self.layerStrategy.print_layers()
-        
-        # 跨供应商传递的"完成面"候选点
-        cross_supplier_candidate_points = []
-
-        for supplier_name in suppliers_sequence:
-            region = next((r for r in self.regions if r.supplier == supplier_name), None)
-            if not region:
-                continue
-
-            print(f"\n--- 开始处理供应商: {supplier_name} ---")
-            print(f"  区域信息: {region}")
-            
-            supplier_cargo = cargo_data.get(supplier_name, [])
-            
-            # 优化：将前一个供应商的"完成面"作为初始候选点
-            initial_points_for_supplier = cross_supplier_candidate_points
-            
-            for layer in self.layerStrategy.get_layers():
-                print(f"  正在处理第 {layer.layerIndex + 1} 层 (高度: {layer.startHeight}cm - {layer.endHeight}cm)")
-                
-                cargo_to_load_in_layer = [
-                    c for c in supplier_cargo 
-                    if c not in [item.cargo for item in self.loadedItems] and \
-                    any(c.getDimensionsForPlacement(p)[2] <= layer.height for p in self._get_allowed_placements(c, layer))
-                ]
-                
-                if not cargo_to_load_in_layer:
-                    print("      本层无合适尺寸的货物可装载，跳过。")
-                    continue
-                
-                # 修正：将继承的候选点与本层的标准起点结合，并作为参数传递
-                layer_initial_points = [p for p in initial_points_for_supplier if layer.startHeight <= p.z < layer.endHeight]
-                
-                self.loadCargoInLayer(region, layer, cargo_to_load_in_layer, layer_initial_points)
-
-            # 为下一个供应商生成"完成面"
-            cross_supplier_candidate_points = self._generate_frontier_points(region)
-
-    def _generate_frontier_points(self, region: Region) -> List[Position]:
-        """扫描区域的结束边界，生成一个"完成面"作为下一个区域的初始候选点。"""
-        frontier_points = []
-        
-        # 修正：通过减去一个极小值，来精确找到边界前的最后一个网格索引
-        frontier_x_grid = int((region.endPosition - 1e-9) / self.grid_size)
-
-        for gy in range(self.spaceManager.gridCount[1]):
-            # 从下往上扫描，找到每个(x,y)柱子上的最高点
-            max_z_in_pillar = -1
-            for gz in range(self.spaceManager.gridCount[2]):
-                if (frontier_x_grid, gy, gz) in self.spaceManager.occupiedCells:
-                    max_z_in_pillar = gz
-            
-            if max_z_in_pillar != -1:
-                # 如果这个柱子被占用了，就在它的最高点的顶上生成一个候选点
-                # 这个新点将位于下一个区域的起点
-                new_x = (frontier_x_grid + 1) * self.grid_size
-                new_y = gy * self.grid_size
-                new_z = (max_z_in_pillar + 1) * self.grid_size
-                frontier_points.append(Position(new_x, new_y, new_z))
-        
-        return frontier_points
-
-    def calculate_regions(self, cargo_data: Dict[str, List[Cargo]], suppliers_sequence: List[str]) -> List[Region]:
-        total_volume = sum(c.volume for sublist in cargo_data.values() for c in sublist)
-        if total_volume == 0:
-            return []
-
+    def _create_supplier_regions(self, suppliers_sequence: List[str], all_cargo: List[Cargo]):
         regions = []
-        current_position = 0.0
-        container_length = self.container_dims[0]
-
-        for supplier in suppliers_sequence:
-            supplier_volume = sum(c.volume for c in cargo_data.get(supplier, []))
-            ratio = supplier_volume / total_volume
-            region_length = container_length * ratio
-            
-            region = Region(
-                startPosition=current_position,
-                endPosition=current_position + region_length,
-                width=self.container_dims[1],
-                height=self.container_dims[2],
-                supplier=supplier
-            )
-            regions.append(region)
-            current_position += region_length
+        total_container_length = self.container_dims[0]
+        supplier_volumes = {s: 0 for s in suppliers_sequence}
+        for cargo in all_cargo:
+            if cargo.supplier in supplier_volumes:
+                supplier_volumes[cargo.supplier] += cargo.volume
         
+        total_volume = sum(supplier_volumes.values())
+        if total_volume == 0: return []
+
+        current_pos = 0
+        for supplier in suppliers_sequence:
+            volume_ratio = supplier_volumes[supplier] / total_volume if total_volume > 0 else 0
+            region_length = total_container_length * volume_ratio
+            end_pos = current_pos + region_length
+            regions.append(SupplierRegion(supplier, current_pos, end_pos))
+            current_pos = end_pos
+        
+        if regions:
+            regions[-1].end_position = total_container_length
         return regions
 
-    def generate_report(self):
+    def optimize(self, suppliers_sequence: List[str], cargo_data: List[dict]):
         """
-        生成最终的装载报告。
+        主优化流程。
+        仅执行高质量初始解的构建，并直接输出结果。
         """
-        print("\n\n=== 最终装载报告 ===")
+        print("开始贪心优化流程...")
+        start_time = time.time()
+
+        self.all_cargo = self._preprocess_cargo(cargo_data)
+        self.regions = self._create_supplier_regions(suppliers_sequence, self.all_cargo)
+        self.layer_strategy = LayerStrategy(self.container_dims, self.all_cargo)
+        self.layer_strategy.print_layers()
+
+        # --- 构建高质量的初始解 ---
+        print("\n--> 正在构建初始解...")
+        solution = self._create_initial_solution()
+        if not solution:
+            print("错误：无法生成初始解。")
+            return
+            
+        print(f"\n初始解构建完成，装载率: {self._get_volume_ratio(solution):.2%}")
+
+        # --- 输出最终报告和可视化 ---
+        self._print_final_report(solution, time.time() - start_time)
+        self._create_3d_visualization(solution)
+        self._export_solution_to_excel(solution)
+
+    def _get_candidate_points(self, solution: PackingSolution) -> List[Position]:
+        """
+        生成有价值的候选放置点。
+        优化版本：减少候选点密度，提升性能。
+        """
+        points = {Position(0, 0, 0)}
         
+        for item in solution.placed_items:
+            l, w, h = item.current_dims
+            pos = item.position
+            
+            # 原有的边缘候选点
+            points.add(Position(pos.x + l, pos.y, pos.z))
+            points.add(Position(pos.x, pos.y + w, pos.z))
+            points.add(Position(pos.x, pos.y, pos.z + h))
+            
+            # 优化：只在特别矮的货物（高度<10cm）顶部生成少量候选点
+            if h < 10 and pos.z + h < self.container_dims[2] - 10:
+                # 只在货物顶部的中心和边缘生成候选点，减少数量
+                points.add(Position(pos.x + l/2, pos.y + w/2, pos.z + h))  # 中心点
+                points.add(Position(pos.x, pos.y, pos.z + h))              # 左下角
+                points.add(Position(pos.x + l, pos.y, pos.z + h))          # 右下角
+        
+        # 按LBD黄金法则排序 (z, y, x)
+        return sorted(list(points), key=lambda p: (p.z, p.y, p.x))
+
+    def _find_best_placement_for_cargo(self, cargo: Cargo, solution: PackingSolution, region: SupplierRegion) -> Tuple[Position, PlacementType]:
+        """为单个货物在指定区域内寻找最佳放置位置(LBD策略)"""
+        # 获取基础候选点
+        point_set = set(self._get_candidate_points(solution))
+        # 【关键修复】确保每个区域都有一个起始锚点
+        point_set.add(Position(region.start_position, 0, 0))
+        candidate_points = sorted(list(point_set), key=lambda p: (p.z, p.y, p.x))
+        
+        for point in candidate_points:
+            allowed_placements = self.layer_strategy.get_allowed_placements(point.z)
+            for orientation in allowed_placements:
+                cargo.set_orientation(orientation)
+                if not region.is_inside(point.x, point.x + cargo.length):
+                    continue
+                    
+                if self._is_valid_placement(cargo, point, orientation, solution, region):
+                    return point, orientation
+        return None, None
+
+    def _calculate_support_ratio(self, cargo: Cargo, position: Position, solution: PackingSolution) -> float:
+        """
+        计算货物底面的支撑率
+        返回值：0.0-1.0之间，表示底面被支撑的比例
+        """
+        # 地面货物始终有100%支撑
+        if position.z == 0:
+            return 1.0
+        
+        cargo_length = cargo.length
+        cargo_width = cargo.width
+        bottom_area = cargo_length * cargo_width
+        
+        if bottom_area == 0:
+            return 0.0
+        
+        supported_area = 0.0
+        
+        # 检查所有已放置的货物
+        for item in solution.placed_items:
+            item_top_z = item.position.z + item.current_dims[2]
+            
+            # 只考虑顶部正好接触当前货物底部的物品（容差0.1cm）
+            if abs(item_top_z - position.z) > 0.1:
+                continue
+            
+            # 计算XY平面上的重叠区域
+            x_overlap_start = max(position.x, item.position.x)
+            x_overlap_end = min(position.x + cargo_length, item.position.x + item.current_dims[0])
+            y_overlap_start = max(position.y, item.position.y)
+            y_overlap_end = min(position.y + cargo_width, item.position.y + item.current_dims[1])
+            
+            # 如果有重叠
+            if x_overlap_start < x_overlap_end and y_overlap_start < y_overlap_end:
+                overlap_area = (x_overlap_end - x_overlap_start) * (y_overlap_end - y_overlap_start)
+                supported_area += overlap_area
+        
+        return supported_area / bottom_area
+
+    def _check_center_stability(self, cargo: Cargo, position: Position, solution: PackingSolution) -> bool:
+        """
+        检查货物重心是否在支撑范围内，确保稳定性
+        """
+        if position.z == 0:
+            return True  # 地面货物始终稳定
+        
+        # 计算货物重心
+        center_x = position.x + cargo.length / 2
+        center_y = position.y + cargo.width / 2
+        
+        # 找出支撑区域的边界
+        support_min_x = float('inf')
+        support_max_x = float('-inf')
+        support_min_y = float('inf')
+        support_max_y = float('-inf')
+        has_support = False
+        
+        for item in solution.placed_items:
+            item_top_z = item.position.z + item.current_dims[2]
+            
+            # 只考虑正好支撑的货物
+            if abs(item_top_z - position.z) > 0.1:
+                continue
+            
+            # 计算支撑区域
+            x_overlap_start = max(position.x, item.position.x)
+            x_overlap_end = min(position.x + cargo.length, item.position.x + item.current_dims[0])
+            y_overlap_start = max(position.y, item.position.y)
+            y_overlap_end = min(position.y + cargo.width, item.position.y + item.current_dims[1])
+            
+            if x_overlap_start < x_overlap_end and y_overlap_start < y_overlap_end:
+                has_support = True
+                support_min_x = min(support_min_x, x_overlap_start)
+                support_max_x = max(support_max_x, x_overlap_end)
+                support_min_y = min(support_min_y, y_overlap_start)
+                support_max_y = max(support_max_y, y_overlap_end)
+        
+        if not has_support:
+            return False
+        
+        # 重心必须在支撑区域内，保留15%的安全边距
+        margin_x = (support_max_x - support_min_x) * 0.15
+        margin_y = (support_max_y - support_min_y) * 0.15
+        
+        # 检查重心是否在安全范围内
+        return (support_min_x + margin_x <= center_x <= support_max_x - margin_x and
+                support_min_y + margin_y <= center_y <= support_max_y - margin_y)
+
+    def _is_valid_placement(self, cargo: Cargo, position: Position, orientation: PlacementType, solution: PackingSolution, region: SupplierRegion) -> bool:
+        """
+        使用高效的AABB碰撞检测和硬边界约束。
+        """
+        cargo.set_orientation(orientation)
+        px, py, pz = position.x, position.y, position.z
+        pl, pw, ph = cargo.length, cargo.width, cargo.height
+
+        # Part 1: 容器Y/Z轴边界和分层检查
+        if not (py >= 0 and pz >= 0 and
+                py + pw <= self.container_dims[1] and
+                pz + ph <= self.container_dims[2]):
+            return False
+        
+        if orientation not in self.layer_strategy.get_allowed_placements(pz):
+            return False
+
+        # Part 2: 供应商区域硬边界检查 (X轴)
+        if not (px >= region.start_position and px + pl <= region.end_position):
+            return False
+
+        # Part 3: 与已放置货物的碰撞检查
+        for item in solution.placed_items:
+            ix, iy, iz = item.position.x, item.position.y, item.position.z
+            il, iw, ih = item.current_dims
+            
+            if (px < ix + il and px + pl > ix and
+                py < iy + iw and py + pw > iy and
+                pz < iz + ih and pz + ph > iz):
+                return False  # 发生碰撞
+        
+        # Part 4: 支撑检查 (仅非地面货物)
+        if pz > 0:
+            support_ratio = self._calculate_support_ratio(cargo, position, solution)
+            # 提高到70%的底面支撑要求，确保运输稳定性
+            if support_ratio < 0.7:
+                return False
+            
+            # Part 5: 重心稳定性检查
+            if not self._check_center_stability(cargo, position, solution):
+                return False
+                
+        return True # 所有检查通过，放置有效
+
+    def _create_initial_solution(self, strategy: SortingStrategy = SortingStrategy.VOLUME_DESC, strategy_index: int = 0) -> PackingSolution:
+        """
+        创建一个高质量的初始解，基于LBD（左-下-后）启发式规则。
+        该策略通过系统性地探索高质量的候选点来取代随机性，旨在达到最高的初始装载率。
+        :param strategy: 决定货物处理顺序的排序策略。
+        :param strategy_index: 用于tqdm进度条定位的索引。
+        """
+        # 不再需要这行打印，tqdm会提供更详细的信息
+        # print(f"开始使用策略 [{strategy.value}] 构建初始解...")
+        solution = PackingSolution(self.all_cargo)
+        
+        # 根据所选策略对货物进行排序
+        sorted_cargo = []
+        if strategy == SortingStrategy.VOLUME_DESC:
+            sorted_cargo = sorted(self.all_cargo, key=lambda c: c.volume, reverse=True)
+        elif strategy == SortingStrategy.AREA_DESC:
+            # 使用原始尺寸计算最大底面积
+            sorted_cargo = sorted(self.all_cargo, key=lambda c: c.original_dims[0] * c.original_dims[1], reverse=True)
+        elif strategy == SortingStrategy.MAX_DIM_DESC:
+            # 使用原始尺寸计算最长边
+            sorted_cargo = sorted(self.all_cargo, key=lambda c: max(c.original_dims), reverse=True)
+        elif strategy == SortingStrategy.RANDOM_SHUFFLE:
+            sorted_cargo = list(self.all_cargo)
+            random.shuffle(sorted_cargo)
+        
+        # 使用tqdm包装循环以显示进度条
+        # desc是进度条的描述，position让每个进度条独立占一行
+        # leave=True, 防止因进程结束时清除进度条导致的光标混乱问题
+        # ncols=100, dynamic_ncols=False, 禁用动态宽度调整，进一步避免多进程渲染冲突
+        for cargo in tqdm(sorted_cargo, desc=f"策略 {strategy.value}", position=strategy_index, leave=True, ncols=100, dynamic_ncols=False):
+            region = next((r for r in self.regions if r.name == cargo.supplier), None)
+            if not region: continue
+
+            best_placement = None
+            
+            # 1. 获取候选点
+            point_set = set(self._get_candidate_points(solution))
+            # 【关键修复】确保每个区域都有一个起始锚点
+            point_set.add(Position(region.start_position, 0, 0))
+            candidate_points = sorted(list(point_set), key=lambda p: (p.z, p.y, p.x))
+            
+            # 2. 遍历所有候选点，寻找最佳位置
+            for point in candidate_points:
+                # 这是一个基础检查，更详细的检查在_is_valid_placement中
+                if not (region.start_position <= point.x < region.end_position):
+                    continue
+
+                allowed_placements = self.layer_strategy.get_allowed_placements(point.z)
+                for orientation in allowed_placements:
+                    cargo.set_orientation(orientation)
+                    
+                    if self._is_valid_placement(cargo, point, orientation, solution, region):
+                        # 找到第一个可行的位置就接受，因为点是排序过的
+                        best_placement = (point, orientation)
+                        break
+                if best_placement:
+                    break
+            
+            # 3. 如果找到了位置，就放置货物
+            if best_placement:
+                pos, orient = best_placement
+                solution.add_item(cargo, pos, orient)
+        
+        final_rate = self._get_volume_ratio(solution)
+        # print(f"策略 [{strategy.value}] 构建完成。装载率: {final_rate:.2%}, 件数: {len(solution.placed_items)}")
+        return solution
+
+    def _get_volume_ratio(self, solution: PackingSolution) -> float:
+        if not solution: return 0.0
         container_volume = self.container_dims[0] * self.container_dims[1] * self.container_dims[2]
-        
-        total_loaded_volume = sum(item.cargo.volume for item in self.loadedItems)
-        
-        final_rate = (total_loaded_volume / container_volume * 100) if container_volume > 0 else 0
-        
-        print(f"最终装柜率: {final_rate:.2f}%")
-        print(f"总装载体积: {total_loaded_volume:.2f} cm³ / {container_volume:.2f} cm³")
-        print(f"总装载件数: {len(self.loadedItems)}")
+        if container_volume == 0: return 0.0
+        return solution.total_volume / container_volume
 
-        print("\n--- 各供应商分区利用率 ---")
-        if not self.regions:
-            print("    未定义供应商分区。")
+    def _print_final_report(self, solution: PackingSolution, duration: float):
+        print("\n\n=== 最终装载报告 ===")
+        final_ratio = self._get_volume_ratio(solution)
+        print(f"最终装柜率: {final_ratio:.2%}")
+        container_volume = self.container_dims[0] * self.container_dims[1] * self.container_dims[2]
+        print(f"总装载体积: {solution.total_volume:.2f} cm³ / {container_volume:.2f} cm³")
+        print(f"总装载件数: {len(solution.placed_items)}")
+        if solution.placed_items:
+            suppliers_in_solution = sorted(list(set(item.cargo.supplier for item in solution.placed_items)))
+            print(f"涉及供应商: {', '.join(suppliers_in_solution)}")
+        print(f">>> 优化总耗时: {duration:.2f} 秒")
+
+    def _export_solution_to_excel(self, solution: PackingSolution, save_path: str = "装载方案详情.xlsx"):
+        """将详细的装载方案导出为Excel文件。"""
+        print(f"\n正在将详细装载方案导出至Excel文件: {save_path}...")
+        
+        if not solution.placed_items:
+            print("警告：装载方案为空，无法导出Excel。")
+            return
+
+        solution_data = []
+        for item in solution.placed_items:
+            solution_data.append({
+                '貨物名稱': item.cargo.cargo_id,
+                '供應商': item.cargo.supplier,
+                '原始長度': item.cargo.original_dims[0],
+                '原始寬度': item.cargo.original_dims[1],
+                '原始高度': item.cargo.original_dims[2],
+                '放置座標X': round(item.position.x, 2),
+                '放置座標Y': round(item.position.y, 2),
+                '放置座標Z': round(item.position.z, 2),
+                '擺放方式': item.orientation.value,
+                '當前長度': item.current_dims[0],
+                '當前寬度': item.current_dims[1],
+                '當前高度': item.current_dims[2],
+            })
+        
+        df = pd.DataFrame(solution_data)
+        
+        # 按放置位置（X, Y, Z）排序，更好地反映实际装载顺序
+        print("正在根据物理位置排序方案，以便查看...")
+        df_sorted = df.sort_values(by=['放置座標X', '放置座標Y', '放置座標Z'])
+        
+        try:
+            df_sorted.to_excel(save_path, index=False, engine='openpyxl')
+            print(f"Excel文件已成功保存至: {save_path}")
+        except Exception as e:
+            print(f"错误：导出Excel文件失败。原因: {e}")
+
+    def _create_3d_visualization(self, solution: PackingSolution, save_path: str = "container_3d_visualization.png"):
+        """创建装载方案的3D可视化图"""
+        print("\n正在生成3D可视化图...")
+        
+        # 设置中文字体，解决中文显示问题
+        plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'SimHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+        
+        fig = plt.figure(figsize=(16, 12))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # 设置供应商颜色映射
+        supplier_colors = {
+            '纽蓝': 'lightblue',
+            '海信': 'lightgreen',
+            '福美高': 'lightcoral'
+        }
+        
+        # 绘制集装箱边框
+        container_x, container_y, container_z = self.container_dims
+        # 定义集装箱的8个顶点
+        container_vertices = [
+            [0, 0, 0], [container_x, 0, 0], [container_x, container_y, 0], [0, container_y, 0],  # 底面
+            [0, 0, container_z], [container_x, 0, container_z], [container_x, container_y, container_z], [0, container_y, container_z]  # 顶面
+        ]
+        
+        # 定义集装箱的12条边
+        container_edges = [
+            [0, 1], [1, 2], [2, 3], [3, 0],  # 底面边
+            [4, 5], [5, 6], [6, 7], [7, 4],  # 顶面边
+            [0, 4], [1, 5], [2, 6], [3, 7]   # 垂直边
+        ]
+        
+        # 绘制集装箱边框线
+        for edge in container_edges:
+            points = [container_vertices[edge[0]], container_vertices[edge[1]]]
+            ax.plot3D(*zip(*points), 'k-', linewidth=1, alpha=0.3)
+        
+        # 绘制每个已放置的货物
+        for i, item in enumerate(solution.placed_items):
+            x, y, z = item.position.x, item.position.y, item.position.z
+            l, w, h = item.current_dims
+            
+            # 获取供应商对应的颜色
+            color = supplier_colors.get(item.cargo.supplier, 'gray')
+            
+            # 定义立方体的8个顶点
+            vertices = [
+                [x, y, z], [x+l, y, z], [x+l, y+w, z], [x, y+w, z],  # 底面
+                [x, y, z+h], [x+l, y, z+h], [x+l, y+w, z+h], [x, y+w, z+h]  # 顶面
+            ]
+            
+            # 定义立方体的6个面
+            faces = [
+                [vertices[0], vertices[1], vertices[5], vertices[4]],  # 前面
+                [vertices[2], vertices[3], vertices[7], vertices[6]],  # 后面
+                [vertices[0], vertices[3], vertices[7], vertices[4]],  # 左面
+                [vertices[1], vertices[2], vertices[6], vertices[5]],  # 右面
+                [vertices[0], vertices[1], vertices[2], vertices[3]],  # 底面
+                [vertices[4], vertices[5], vertices[6], vertices[7]]   # 顶面
+            ]
+            
+            # 创建3D多边形集合并添加到图中
+            face_collection = Poly3DCollection(faces, alpha=0.7, facecolor=color, edgecolor='black', linewidth=0.5)
+            ax.add_collection3d(face_collection)
+        
+        # 设置轴标签和标题
+        ax.set_xlabel('长度 (cm)', fontsize=12)
+        ax.set_ylabel('宽度 (cm)', fontsize=12)
+        ax.set_zlabel('高度 (cm)', fontsize=12)
+        ax.set_title(f'集装箱装载3D可视化\n装载率: {self._get_volume_ratio(solution):.2%} | 装载件数: {len(solution.placed_items)}件', fontsize=16)
+        
+        # 设置轴的显示范围
+        ax.set_xlim([0, container_x])
+        ax.set_ylim([0, container_y])
+        ax.set_zlim([0, container_z])
+        
+        # 添加网格
+        ax.grid(True, alpha=0.3)
+        
+        # 添加图例
+        from matplotlib.patches import Patch
+        legend_elements = [Patch(facecolor=color, label=supplier) 
+                          for supplier, color in supplier_colors.items()]
+        ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(0.02, 0.98))
+        
+        # 设置最佳视角
+        ax.view_init(elev=20, azim=45)
+        
+        # 保存图片
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"3D可视化图已保存至: {save_path}")
+        
+        # 不再调用plt.show()，因为它会阻塞程序，尤其是在非交互式环境下
+        # plt.show()
+        plt.close(fig) # 添加此行以关闭图形对象，释放内存
+
+class PermutationOptimizer:
+    """
+    排列优化器，寻找最优的供应商取货顺序。
+    实现了混合策略：
+    - 当供应商数量较少(<=4)时，进行全量暴力计算，确保找到理论最优解。(方案A)
+    - 当供应商数量较多(>4)时，启动两阶段优化，在效率和效果间取得平衡。(方案C)
+    """
+    def __init__(self, container_dims: Tuple[int, int, int], cargo_data: List[dict]):
+        self.container_dims = container_dims
+        self.cargo_data = cargo_data
+        self.all_suppliers = self._extract_suppliers(cargo_data)
+        # 将报告和可视化方法从Greedy类移到这里，由顶层控制器统一管理
+        self.reporter = GreedyContainerOptimizer(container_dims)
+
+    def _extract_suppliers(self, cargo_data: List[dict]) -> List[str]:
+        """从货物数据中提取不重复的供应商列表"""
+        supplier_pattern = re.compile(r'（(.*?)）')
+        suppliers_sequence = []
+        seen_suppliers = set()
+        for item in cargo_data:
+            match = supplier_pattern.search(item.get('貨物名稱', ''))
+            if match:
+                supplier_name = match.group(1)
+                if supplier_name not in seen_suppliers:
+                    seen_suppliers.add(supplier_name)
+                    suppliers_sequence.append(supplier_name)
+        return suppliers_sequence
+
+    def run_optimization(self, top_n_results: int = 3, supplier_threshold: int = 4, fast_screen_top_k: int = 5):
+        """主优化流程，根据供应商数量自动选择策略"""
+        from itertools import permutations
+        
+        all_sequences = list(permutations(self.all_suppliers))
+        num_sequences = len(all_sequences)
+
+        print(f"\n========================================================")
+        print(f"  启动供应商顺序优化流程")
+        print(f"  发现 {len(self.all_suppliers)} 个供应商, 将探索 {num_sequences} 种取货顺序。")
+        print(f"========================================================")
+
+        if num_sequences == 0:
+            print("错误：货物数据中未发现任何供应商信息，无法执行优化。")
+            return
+        
+        final_results = []
+        # --- 混合策略决策点 (已修复) ---
+        # 判断条件应为供应商数量，而非排列组合的数量
+        if len(self.all_suppliers) <= supplier_threshold:
+            print(f"\n模式: [方案A] 全量优化 (供应商数量 <= {supplier_threshold})")
+            print(f"将对全部 {num_sequences} 种供应商顺序进行完整的多策略优化。")
+            final_results = self._run_full_optimization_on_sequences(all_sequences)
         else:
-            for region in self.regions:
-                region_volume = (region.endPosition - region.startPosition) * self.container_dims[1] * self.container_dims[2]
-                
-                loaded_in_region = [item for item in self.loadedItems if item.cargo.supplier == region.supplier]
-                volume_in_region = sum(item.cargo.volume for item in loaded_in_region)
-                
-                region_rate = (volume_in_region / region_volume * 100) if region_volume > 0 else 0
-                print(f"  - 供应商: {region.supplier}")
-                print(f"    - 区域空间占比: {(region_volume / container_volume * 100):.2f}%")
-                print(f"    - 空间利用率: {region_rate:.2f}%")
+            print(f"\n模式: [方案C] 两阶段优化 (供应商数量 > {supplier_threshold})")
+            # --- 第一阶段：快速筛选 ---
+            print(f"\n[第一阶段] 快速筛选 {num_sequences} 种顺序...")
+            screened_results = self._run_fast_screening(all_sequences)
+            
+            # 排序并筛选出Top-K种子选手
+            screened_results.sort(key=lambda x: x['rate'], reverse=True)
+            top_k_sequences = [res['sequence'] for res in screened_results[:fast_screen_top_k]]
+            
+            print(f"\n快速筛选完成。选出 Top-{len(top_k_sequences)} 的种子选手进入下一阶段。")
+            for i, res in enumerate(screened_results[:fast_screen_top_k]):
+                print(f"  - 候选 {i+1}: {' -> '.join(res['sequence'])}, 潜力分: {res['rate']:.2%}")
 
+            # --- 第二阶段：精细优化 ---
+            print(f"\n[第二阶段] 对 {len(top_k_sequences)} 名种子选手进行完整多策略优化...")
+            final_results = self._run_full_optimization_on_sequences(top_k_sequences)
 
-def loadRealDataFromExcel(filePath: str) -> Tuple[List[str], Dict[str, List[Cargo]]]:
-    """
-    从Excel文件加载真实货物数据
-    
-    Args:
-        filePath: Excel文件路径
+        # --- 最终结果报告与输出 ---
+        self._generate_final_reports(final_results, top_n_results)
+
+    def _run_full_optimization_on_sequences(self, sequences_to_run: List[Tuple[str, ...]]) -> List[dict]:
+        """对给定的顺序列表，并行执行完整的多策略优化"""
+        tasks = []
+        strategies_to_run = [
+            SortingStrategy.VOLUME_DESC, SortingStrategy.AREA_DESC,
+            SortingStrategy.MAX_DIM_DESC, SortingStrategy.RANDOM_SHUFFLE
+        ]
         
-    Returns:
-        供应商顺序列表和按供应商分组的货物数据
-    """
+        for seq in sequences_to_run:
+            for strat in strategies_to_run:
+                # 每个任务包含 (供应商顺序, 货物排序策略, 任务索引)
+                tasks.append((seq, strat, len(tasks)))
+        
+        print(f"共创建 {len(tasks)} 个并行计算任务...")
+        
+        results_by_sequence = {}
+        with ProcessPoolExecutor(max_workers=len(strategies_to_run) * 2) as executor:
+            future_to_task = {
+                executor.submit(self._run_single_strategy, task): task for task in tasks
+            }
+            
+            for future in tqdm(as_completed(future_to_task), total=len(tasks), desc="完整优化"):
+                res = future.result()
+                if not res: continue
+                
+                sequence = res['sequence']
+                if sequence not in results_by_sequence:
+                    results_by_sequence[sequence] = []
+                results_by_sequence[sequence].append(res)
+        
+        # 从每个顺序的结果中选出最好的那个
+        best_results = []
+        for sequence, strategy_results in results_by_sequence.items():
+            best_for_seq = max(strategy_results, key=lambda x: x['rate'])
+            best_results.append(best_for_seq)
+        
+        return best_results
+
+    def _run_fast_screening(self, all_sequences: List[Tuple[str, ...]]) -> List[dict]:
+        """对所有顺序组合进行快速的单策略评估"""
+        tasks = []
+        # 固定使用最高效的体积排序策略进行快速筛选
+        screening_strategy = SortingStrategy.VOLUME_DESC
+        for seq in all_sequences:
+            tasks.append((seq, screening_strategy, len(tasks)))
+
+        screened_results = []
+        with ProcessPoolExecutor(max_workers=len(all_sequences)) as executor:
+            future_to_task = {
+                executor.submit(self._run_single_strategy, task): task for task in tasks
+            }
+            
+            for future in tqdm(as_completed(future_to_task), total=len(tasks), desc="快速评估"):
+                res = future.result()
+                if res:
+                    screened_results.append(res)
+        return screened_results
+
+    def _run_single_strategy(self, task: Tuple) -> dict:
+        """
+        [工作单元] 运行单个策略，这是所有并行任务的最小执行单元。
+        :param task: 一个元组 (suppliers_sequence, sorting_strategy, task_index)
+        :return: 一个包含结果的字典
+        """
+        suppliers_sequence, sorting_strategy, task_index = task
+        
+        # 每个进程拥有自己独立的优化器实例，确保无状态和线程安全
+        optimizer = GreedyContainerOptimizer(self.container_dims)
+        optimizer.all_cargo = optimizer._preprocess_cargo(self.cargo_data)
+        optimizer.regions = optimizer._create_supplier_regions(suppliers_sequence, optimizer.all_cargo)
+        optimizer.layer_strategy = LayerStrategy(optimizer.container_dims, optimizer.all_cargo)
+        
+        solution = optimizer._create_initial_solution(sorting_strategy, task_index)
+        
+        if solution and solution.placed_items:
+            rate = optimizer._get_volume_ratio(solution)
+            return {
+                'sequence': suppliers_sequence,
+                'strategy': sorting_strategy,
+                'rate': rate,
+                'solution': solution
+            }
+        return None
+
+    def _generate_final_reports(self, final_results: List[dict], top_n: int):
+        """生成最终的Top-N报告"""
+        if not final_results:
+            print("\n错误：未能生成任何有效的装载方案。")
+            return
+            
+        print(f"\n\n========================================================")
+        print(f"  所有计算完成，最终择优方案如下 (Top {top_n})")
+        print(f"========================================================")
+        
+        final_results.sort(key=lambda x: x['rate'], reverse=True)
+        
+        solutions_to_report = final_results[:min(top_n, len(final_results))]
+
+        for i, result in enumerate(solutions_to_report):
+            rank = i + 1
+            sequence_str = ' -> '.join(result['sequence'])
+            rate_str = f"{result['rate']:.2%}"
+            
+            print(f"\n--- [方案 Top {rank}] ---")
+            print(f"  - 推荐取货顺序: {sequence_str}")
+            print(f"  - 最高装柜率: {rate_str} (由'{result['strategy'].value}'策略达成)")
+            
+            # 生成带唯一标识的文件名
+            sequence_file_str = '-'.join(result['sequence'])
+            file_prefix = f"方案_{rank}_顺序_{sequence_file_str}_装载率_{result['rate']:.4f}"
+            excel_path = f"{file_prefix}.xlsx"
+            image_path = f"{file_prefix}.png"
+
+            print(f"  - 正在生成详细报告: {excel_path}")
+            print(f"  - 正在生成3D视图: {image_path}")
+
+            # 调用从Greedy类移过来的报告和可视化方法
+            self.reporter._export_solution_to_excel(result['solution'], save_path=excel_path)
+            self.reporter._create_3d_visualization(result['solution'], save_path=image_path)
+            
+        print("\n所有报告生成完毕。")
+
+def load_cargo_data(file_path: str) -> List[dict]:
     try:
-        import pandas as pd
-        
-        # 读取Excel文件
-        df = pd.read_excel(filePath)
-        
-        # 提取供应商信息
-        df['供应商'] = df['貨物名稱'].str.extract(r'（(.+?)）')
-        
-        # 统计供应商货物数量，按数量降序排列作为访问顺序
-        supplierCounts = df.groupby('供应商')['數量'].sum().sort_values(ascending=False)
-        supplierSequence = supplierCounts.index.tolist()
-        
-        # 按供应商分组数据
-        cargoData = {}
-        for supplier in supplierSequence:
-            supplierData = df[df['供应商'] == supplier]
-            cargoList = []
-            
-            for _, row in supplierData.iterrows():
-                cargo = Cargo(
-                    cargoId=row['貨物名稱'],
-                    supplier=supplier,
-                    length=float(row['長度']),
-                    width=float(row['寬度']),
-                    height=float(row['高度']),
-                    weight=float(row['重量']),
-                    quantity=int(row['數量'])
-                )
-                cargoList.append(cargo)
-            
-            cargoData[supplier] = cargoList
-        
-        # 打印数据统计
-        totalQuantity = df['數量'].sum()
-        totalWeight = df['重量'].sum()
-        totalVolume = (df['長度'] * df['寬度'] * df['高度'] * df['數量']).sum()
-        
-        print(f"=== 真实数据加载完成 ===")
-        print(f"总货物种类: {len(df)}")
-        print(f"总货物数量: {totalQuantity}")
-        print(f"总重量: {totalWeight:.2f}kg")
-        print(f"总体积: {totalVolume:.2f}cm³")
-        print(f"供应商数量: {len(supplierSequence)}")
-        print(f"供应商顺序: {supplierSequence}")
-        
-        for supplier in supplierSequence:
-            supplierData = df[df['供应商'] == supplier]
-            supplierQuantity = supplierData['數量'].sum()
-            supplierVolume = (supplierData['長度'] * supplierData['寬度'] * supplierData['高度'] * supplierData['數量']).sum()
-            print(f"  {supplier}: {len(supplierData)}种货物, {supplierQuantity}件, 体积{supplierVolume:.2f}cm³")
-        
-        return supplierSequence, cargoData
-        
+        excel_data = pd.read_excel(file_path)
+        cargo_data = excel_data.to_dict('records')
+        print("=== 真实数据加载完成 ===")
+        return cargo_data
     except Exception as e:
-        print(f"加载真实数据时发生错误: {e}")
-        return [], {}
-
+        print(f"加载数据时出错: {e}")
+        return None
 
 def main():
-    """主函数，执行整个优化流程"""
-    startTime = time.time()
-    
-    # 1. 从Excel加载真实数据
-    supplier_sequence, cargo_by_supplier = loadRealDataFromExcel('装柜0538.xlsx')
-    
-    # 2. 初始化优化器
     container_dims = (1180, 230, 260)
-    grid_size = 5.0
-    optimizer = SupplierBasedContainerOptimizer(container_dims, grid_size)
-    
-    # 3. 执行优化
-    optimizer.optimize(
-        cargo_data=cargo_by_supplier,
-        suppliers_sequence=supplier_sequence
-    )
-    
-    # 4. 生成报告
-    optimizer.generate_report()
-    
-    endTime = time.time()
-    print(f"\n>>> 优化总耗时: {endTime - startTime:.2f} 秒")
+    cargo_data = load_cargo_data("装柜0538.xlsx")
+    if not cargo_data: return
 
+    total_items = sum(item['數量'] for item in cargo_data)
+    total_volume_theoretical = sum(item['長度']*item['寬度']*item['高度']*item['數量'] for item in cargo_data)
+    print(f"总货物种类: {len(cargo_data)}")
+    print(f"总货物数量: {total_items}")
+    print(f"理论总体积: {total_volume_theoretical:.2f}cm³")
 
-if __name__ == '__main__':
-    main() 
+    # 使用新的排列优化器作为主入口
+    optimizer = PermutationOptimizer(container_dims=container_dims, cargo_data=cargo_data)
+    optimizer.run_optimization()
+
+if __name__ == "__main__":
+    main()
