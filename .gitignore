@@ -1,2 +1,17 @@
-myenv/
+# Environments
 env/
+.env
+.venv
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Result files
+/optimization_results/
+
+# Old result files that may remain locally
+/container_3d_visualization.png
+/方案_*.png
+/方案_*.xlsx
