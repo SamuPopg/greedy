@@ -702,6 +702,8 @@ class PermutationOptimizer:
         """主优化流程，根据供应商数量自动选择策略"""
         from itertools import permutations
         
+        start_time = time.time()
+        
         all_sequences = list(permutations(self.all_suppliers))
         num_sequences = len(all_sequences)
 
@@ -740,7 +742,8 @@ class PermutationOptimizer:
             final_results = self._run_full_optimization_on_sequences(top_k_sequences)
 
         # --- 最终结果报告与输出 ---
-        self._generate_final_reports(final_results, top_n_results)
+        duration = time.time() - start_time
+        self._generate_final_reports(final_results, top_n_results, duration)
 
     def _run_full_optimization_on_sequences(self, sequences_to_run: List[Tuple[str, ...]]) -> List[dict]:
         """对给定的顺序列表，并行执行完整的多策略优化"""
@@ -826,7 +829,7 @@ class PermutationOptimizer:
             }
         return None
 
-    def _generate_final_reports(self, final_results: List[dict], top_n: int):
+    def _generate_final_reports(self, final_results: List[dict], top_n: int, duration: float):
         """生成最终的Top-N报告"""
         if not final_results:
             print("\n错误：未能生成任何有效的装载方案。")
@@ -863,6 +866,7 @@ class PermutationOptimizer:
             self.reporter._create_3d_visualization(result['solution'], save_path=image_path)
             
         print("\n所有报告生成完毕。")
+        print(f">>> 供应商顺序探索总耗时: {duration:.2f} 秒")
 
 def load_cargo_data(file_path: str) -> List[dict]:
     try:
