@@ -698,7 +698,7 @@ class PermutationOptimizer:
                     suppliers_sequence.append(supplier_name)
         return suppliers_sequence
 
-    def run_optimization(self, top_n_results: int = 3, supplier_threshold: int = 4, fast_screen_top_k: int = 5):
+    def run_optimization(self, top_n_results: int = 3, supplier_threshold: int = 2, fast_screen_top_k: int = 5):
         """主优化流程，根据供应商数量自动选择策略"""
         from itertools import permutations
         
