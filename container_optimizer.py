@@ -11,6 +11,8 @@ from enum import Enum
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
 
 class PlacementType(Enum):
     """定义货物的六种摆放方式"""
@@ -190,19 +192,23 @@ class LayerStrategy:
         for layer in self.layers:
             print(f"  层 {layer.index + 1}: 高度 {layer.start_z:.1f}cm - {layer.end_z:.1f}cm (厚度: {layer.end_z - layer.start_z:.1f}cm)")
 
-class SimulatedAnnealingOptimizer:
+class SortingStrategy(Enum):
+    """定义货物排序策略的枚举"""
+    VOLUME_DESC = '体积从大到小'
+    AREA_DESC = '最大底面积从大到小'
+    MAX_DIM_DESC = '最长边从大到小'
+    RANDOM_SHUFFLE = '随机打乱'
+
+class GreedyContainerOptimizer:
+    """
+    基于贪心策略的集装箱优化器。
+    核心思想是构建一个高质量的初始解，并以此为最终结果，追求最快的计算速度。
+    """
     def __init__(self, container_dims: Tuple[int, int, int]):
         self.container_dims = container_dims
         self.all_cargo: List[Cargo] = []
         self.regions: List[SupplierRegion] = []
         self.layer_strategy: LayerStrategy = None
-        
-        # 更激进的快速优化参数
-        self.initial_temp = 5000.0  # 降低初始温度
-        self.final_temp = 1.0
-        self.cooling_rate = 0.75    # 更快的冷却速率
-        self.junction_tolerance = 50.0 # 交接区容差 (cm)
-        self.is_in_optimization_phase = False # 两阶段优化开关
 
     def _preprocess_cargo(self, cargo_data: List[dict]) -> List[Cargo]:
         cargo_list = []
@@ -242,7 +248,11 @@ class SimulatedAnnealingOptimizer:
         return regions
 
     def optimize(self, suppliers_sequence: List[str], cargo_data: List[dict]):
-        print("开始模拟退火优化流程...")
+        """
+        主优化流程。
+        仅执行高质量初始解的构建，并直接输出结果。
+        """
+        print("开始贪心优化流程...")
         start_time = time.time()
 
         self.all_cargo = self._preprocess_cargo(cargo_data)
@@ -250,76 +260,19 @@ class SimulatedAnnealingOptimizer:
         self.layer_strategy = LayerStrategy(self.container_dims, self.all_cargo)
         self.layer_strategy.print_layers()
 
-        # --- Phase 1: Build Initial Solution with HARD Boundaries ---
-        self.is_in_optimization_phase = False
-        print("\n--> Phase 1: Building initial solution with HARD boundaries...")
-        initial_solution = self._create_initial_solution()
-        if not initial_solution:
+        # --- 构建高质量的初始解 ---
+        print("\n--> 正在构建初始解...")
+        solution = self._create_initial_solution()
+        if not solution:
             print("错误：无法生成初始解。")
             return
             
-        current_solution = initial_solution
-        best_solution = initial_solution
-        print(f"Initial solution generated, load rate: {self._get_volume_ratio(initial_solution):.2%}")
+        print(f"\n初始解构建完成，装载率: {self._get_volume_ratio(solution):.2%}")
 
-        current_energy = self._calculate_energy(initial_solution)
-        best_energy = current_energy
-        temp = self.initial_temp
-
-        # --- Phase 2: Start SA Optimization with FLEXIBLE Boundaries ---
-        self.is_in_optimization_phase = True
-        print("--> Phase 2: Starting SA optimization with FLEXIBLE boundaries...")
-        print("开始模拟退火主循环...")
-        
-        # 引入内循环，并在每个温度点上进行多次迭代
-        steps_at_each_temp = 10 # 超快速优化模式
-        
-        # 修改冷却逻辑，以温度点为单位
-        temp_steps = 0
-        total_temp_steps = int(abs(math.log(self.final_temp / self.initial_temp) / math.log(self.cooling_rate))) if self.cooling_rate < 1 else 1
-
-        while temp > self.final_temp:
-            for _ in range(steps_at_each_temp): # 内循环
-                neighbor_solution = self._generate_neighbor(current_solution)
-                if not neighbor_solution or not neighbor_solution.placed_items: 
-                    continue
-
-                neighbor_energy = self._calculate_energy(neighbor_solution)
-                delta_energy = neighbor_energy - current_energy
-
-                if delta_energy > 0:
-                    current_solution = neighbor_solution
-                    current_energy = neighbor_energy
-                    if current_energy > best_energy:
-                        best_solution = neighbor_solution
-                        best_energy = neighbor_energy
-                else:
-                    if random.random() < self._acceptance_probability(delta_energy, temp):
-                        current_solution = neighbor_solution
-                        current_energy = neighbor_energy
-            
-            temp *= self.cooling_rate
-            temp_steps += 1
-            
-            # 更新日志
-            print(f"\r优化中... [温度段: {temp_steps}/{total_temp_steps}] [当前温度: {temp:.1f}] [最优装载率: {self._get_volume_ratio(best_solution):.2%}]", end="")
-
-
-        print("\n模拟退火完成。")
-        self._print_final_report(best_solution, time.time() - start_time)
-        self._create_3d_visualization(best_solution)
-        # 【新版】集成智能顶部空间二次填充
-        smart_filler = SmartTopSpaceFiller(self)
-        smart_filler.fill_top_space(best_solution)
-        
-        # 【新增】集成交换策略优化
-        swapping_optimizer = SwappingOptimizer(self)
-        swapping_optimizer.perform_swaps(best_solution)
-
-        # 再次打印最终报告，查看所有优化的效果
-        print("\n\n=== 所有优化后最终报告 ===")
-        total_duration = time.time() - start_time
-        self._print_final_report(best_solution, total_duration)
+        # --- 输出最终报告和可视化 ---
+        self._print_final_report(solution, time.time() - start_time)
+        self._create_3d_visualization(solution)
+        self._export_solution_to_excel(solution)
 
     def _get_candidate_points(self, solution: PackingSolution) -> List[Position]:
         """
@@ -456,16 +409,13 @@ class SimulatedAnnealingOptimizer:
 
     def _is_valid_placement(self, cargo: Cargo, position: Position, orientation: PlacementType, solution: PackingSolution, region: SupplierRegion) -> bool:
         """
-        使用高效的AABB碰撞检测。
-        【两阶段策略】根据当前是否在优化阶段，使用不同边界检查逻辑。
-        - 初始解构建: 硬边界
-        - 模拟退火: 柔性边界 (带交接区)
+        使用高效的AABB碰撞检测和硬边界约束。
         """
         cargo.set_orientation(orientation)
         px, py, pz = position.x, position.y, position.z
         pl, pw, ph = cargo.length, cargo.width, cargo.height
 
-        # Part 1: Shared Y/Z-axis and Layer Checks (Fast checks first)
+        # Part 1: 容器Y/Z轴边界和分层检查
         if not (py >= 0 and pz >= 0 and
                 py + pw <= self.container_dims[1] and
                 pz + ph <= self.container_dims[2]):
@@ -474,33 +424,11 @@ class SimulatedAnnealingOptimizer:
         if orientation not in self.layer_strategy.get_allowed_placements(pz):
             return False
 
-        # Part 2: Phase-Dependent X-axis Boundary Check
-        if self.is_in_optimization_phase:
-            # 【优化阶段】使用柔性边界
-            region_index = self.regions.index(region)
-            effective_start_x = region.start_position
-            effective_end_x = region.end_position
-            
-            if region_index > 0:
-                effective_start_x -= self.junction_tolerance
-            if region_index < len(self.regions) - 1:
-                effective_end_x += self.junction_tolerance
-            
-            effective_start_x = max(0, effective_start_x)
-            effective_end_x = min(self.container_dims[0], effective_end_x)
+        # Part 2: 供应商区域硬边界检查 (X轴)
+        if not (px >= region.start_position and px + pl <= region.end_position):
+            return False
 
-            if not (px >= effective_start_x and px + pl <= effective_end_x):
-                return False
-                
-            # 锚点规则: 确保货物与原始区域有重叠
-            if not (px < region.end_position and px + pl > region.start_position):
-                return False
-        else:
-            # 【初始解阶段】使用硬边界
-            if not (px >= region.start_position and px + pl <= region.end_position):
-                return False
-
-        # Part 3: Shared Collision Check (Most expensive check last)
+        # Part 3: 与已放置货物的碰撞检查
         for item in solution.placed_items:
             ix, iy, iz = item.position.x, item.position.y, item.position.z
             il, iw, ih = item.current_dims
@@ -510,189 +438,49 @@ class SimulatedAnnealingOptimizer:
                 pz < iz + ih and pz + ph > iz):
                 return False  # 发生碰撞
         
-        # Part 4: Support Check (新增支撑检查)
-        # 只对非地面货物进行支撑检查
+        # Part 4: 支撑检查 (仅非地面货物)
         if pz > 0:
             support_ratio = self._calculate_support_ratio(cargo, position, solution)
             # 提高到70%的底面支撑要求，确保运输稳定性
             if support_ratio < 0.7:
                 return False
             
-            # Part 5: Center Stability Check (重心稳定性检查)
+            # Part 5: 重心稳定性检查
             if not self._check_center_stability(cargo, position, solution):
                 return False
                 
         return True # 所有检查通过，放置有效
 
-    def _generate_neighbor(self, solution: PackingSolution) -> PackingSolution:
-        """
-        生成一个基于"候选点"的邻域解，取代纯随机。
-        【方案C+D】引入多阶段策略，并加入'batch_repack'操作。
-        """
-        neighbor = solution.copy()
-        
-        current_rate = self._get_volume_ratio(solution)
-        
-        # 根据当前装载率动态选择策略
-        if current_rate < 0.86:
-            operations = ['add', 'move', 'remove', 'swap', 'reinsert', 'batch_repack']
-            weights    = [0.3, 0.15, 0.1, 0.2, 0.2, 0.05] # 大幅降低batch_repack的权重
-        elif current_rate < 0.90:
-            operations = ['add', 'move', 'remove', 'swap', 'reinsert', 'batch_repack']
-            weights    = [0.1, 0.15, 0.1, 0.25, 0.3, 0.1]  # 中期，权重也较低
-        else:
-            operations = ['move', 'remove', 'swap', 'reinsert', 'batch_repack']
-            weights    = [0.1, 0.05, 0.3, 0.4, 0.15] # 后期，作为重要的破局手段，但权重仍受控
-        
-        operation = random.choices(operations, weights=weights, k=1)[0]
-
-        if operation == 'add':
-            if not neighbor.unloaded_cargo_set: return neighbor
-            
-            cargo_to_add = random.choice(list(neighbor.unloaded_cargo_set))
-            region = next((r for r in self.regions if r.name == cargo_to_add.supplier), None)
-            if region:
-                pos, orientation = self._find_best_placement_for_cargo(cargo_to_add, neighbor, region)
-                if pos and orientation:
-                    neighbor.add_item(cargo_to_add, pos, orientation)
-            return neighbor
-
-        if operation == 'remove':
-            if not neighbor.placed_items: return neighbor
-            item_to_remove = random.choice(neighbor.placed_items)
-            neighbor.remove_item(item_to_remove)
-            return neighbor
-
-        if operation == 'move':
-            if not neighbor.placed_items: return neighbor
-            
-            item_to_move = random.choice(neighbor.placed_items)
-            original_pos = item_to_move.position
-            original_orient = item_to_move.orientation
-            
-            neighbor.remove_item(item_to_move)
-
-            region = next((r for r in self.regions if r.name == item_to_move.cargo.supplier), None)
-            if region:
-                pos, orientation = self._find_best_placement_for_cargo(item_to_move.cargo, neighbor, region)
-                if pos and orientation:
-                    neighbor.add_item(item_to_move.cargo, pos, orientation)
-                else: # 如果找不到新位置，把物品放回去，保持解的有效性
-                    neighbor.add_item(item_to_move.cargo, original_pos, original_orient)
-
-            return neighbor
-
-        if operation == 'swap':
-            if len(neighbor.placed_items) < 2: return neighbor
-
-            item_a, item_b = random.sample(neighbor.placed_items, 2)
-            
-            # 必须确保交换的两个物品来自同一个供应商，以遵守区域约束
-            if item_a.cargo.supplier != item_b.cargo.supplier:
-                return neighbor
-
-            # 【关键修复】动态获取正确的供应商区域
-            region = next((r for r in self.regions if r.name == item_a.cargo.supplier), None)
-            if not region:
-                return neighbor # 如果找不到区域，则不执行任何操作
-
-            pos_a, orient_a = item_a.position, item_a.orientation
-            pos_b, orient_b = item_b.position, item_b.orientation
-            
-            # 移除A和B，以便检查新位置
-            temp_solution = neighbor.copy()
-            temp_solution.remove_item(item_a)
-            temp_solution.remove_item(item_b)
-
-            # 交叉检查有效性
-            can_b_go_to_a = self._is_valid_placement(item_b.cargo, pos_a, orient_b, temp_solution, region)
-            can_a_go_to_b = self._is_valid_placement(item_a.cargo, pos_b, orient_a, temp_solution, region)
-            
-            if can_a_go_to_b and can_b_go_to_a:
-                # 真正执行交换
-                neighbor.remove_item(item_a)
-                neighbor.remove_item(item_b)
-                neighbor.add_item(item_a.cargo, pos_b, orient_a)
-                neighbor.add_item(item_b.cargo, pos_a, orient_b)
-            
-            return neighbor
-
-        if operation == 'reinsert':
-            if not neighbor.placed_items: return neighbor
-
-            item_to_reinsert = random.choice(neighbor.placed_items)
-            original_pos = item_to_reinsert.position
-            original_orient = item_to_reinsert.orientation
-            
-            neighbor.remove_item(item_to_reinsert)
-
-            region = next((r for r in self.regions if r.name == item_to_reinsert.cargo.supplier), None)
-            if region:
-                pos, orientation = self._find_best_placement_for_cargo(item_to_reinsert.cargo, neighbor, region)
-                if pos and orientation:
-                    neighbor.add_item(item_to_reinsert.cargo, pos, orientation)
-                else: # 安全回退保障
-                    neighbor.add_item(item_to_reinsert.cargo, original_pos, original_orient)
-            else: # 如果找不到区域，也放回去
-                neighbor.add_item(item_to_reinsert.cargo, original_pos, original_orient)
-
-            return neighbor
-
-        if operation == 'batch_repack':
-            if not neighbor.placed_items: return neighbor
-
-            # 1. 随机选择一个区域进行重整
-            target_region = random.choice(self.regions)
-            items_in_region = [item for item in neighbor.placed_items if item.cargo.supplier == target_region.name]
-
-            # 2. 如果物品太少，不执行操作
-            if len(items_in_region) < 5: return neighbor
-
-            # 3. 随机移除该区域5%-10%的货物 (降低强度)
-            repack_count = max(1, int(len(items_in_region) * random.uniform(0.05, 0.1)))
-            items_to_repack = random.sample(items_in_region, repack_count)
-            
-            # 4. 从当前解中移除这些货物
-            cargos_to_repack = []
-            for item in items_to_repack:
-                neighbor.remove_item(item)
-                cargos_to_repack.append(item.cargo)
-            
-            # 5. 将移除的货物按体积从大到小排序，尝试用LBD策略重新装入
-            sorted_cargos = sorted(cargos_to_repack, key=lambda c: c.volume, reverse=True)
-            for cargo in sorted_cargos:
-                # 复用我们最核心的LBD放置函数
-                pos, orientation = self._find_best_placement_for_cargo(cargo, neighbor, target_region)
-                if pos and orientation:
-                    neighbor.add_item(cargo, pos, orientation)
-            # 任何无法装回的货物，会自动留在unloaded_cargo_set中，这完全符合模拟退火的逻辑
-
-            return neighbor
-            
-        return neighbor
-
-    def _calculate_energy(self, solution: PackingSolution) -> float:
-        return solution.total_volume
-
-    def _acceptance_probability(self, delta_energy: float, temperature: float) -> float:
-        if delta_energy > 0: return 1.0
-        return math.exp(delta_energy / temperature)
-
-    def _create_initial_solution(self) -> PackingSolution:
+    def _create_initial_solution(self, strategy: SortingStrategy = SortingStrategy.VOLUME_DESC, strategy_index: int = 0) -> PackingSolution:
         """
         创建一个高质量的初始解，基于LBD（左-下-后）启发式规则。
         该策略通过系统性地探索高质量的候选点来取代随机性，旨在达到最高的初始装载率。
+        :param strategy: 决定货物处理顺序的排序策略。
+        :param strategy_index: 用于tqdm进度条定位的索引。
         """
-        print("开始构建高质量LBD初始解...")
+        # 不再需要这行打印，tqdm会提供更详细的信息
+        # print(f"开始使用策略 [{strategy.value}] 构建初始解...")
         solution = PackingSolution(self.all_cargo)
         
-        # 按体积从大到小排序，优先处理大件货物
-        sorted_cargo = sorted(self.all_cargo, key=lambda c: c.volume, reverse=True)
+        # 根据所选策略对货物进行排序
+        sorted_cargo = []
+        if strategy == SortingStrategy.VOLUME_DESC:
+            sorted_cargo = sorted(self.all_cargo, key=lambda c: c.volume, reverse=True)
+        elif strategy == SortingStrategy.AREA_DESC:
+            # 使用原始尺寸计算最大底面积
+            sorted_cargo = sorted(self.all_cargo, key=lambda c: c.original_dims[0] * c.original_dims[1], reverse=True)
+        elif strategy == SortingStrategy.MAX_DIM_DESC:
+            # 使用原始尺寸计算最长边
+            sorted_cargo = sorted(self.all_cargo, key=lambda c: max(c.original_dims), reverse=True)
+        elif strategy == SortingStrategy.RANDOM_SHUFFLE:
+            sorted_cargo = list(self.all_cargo)
+            random.shuffle(sorted_cargo)
         
-        total_cargo_count = len(sorted_cargo)
-        for i, cargo in enumerate(sorted_cargo):
-            print(f"\r构建初始解... [处理: {i+1}/{total_cargo_count}]", end="")
-            
+        # 使用tqdm包装循环以显示进度条
+        # desc是进度条的描述，position让每个进度条独立占一行
+        # leave=True, 防止因进程结束时清除进度条导致的光标混乱问题
+        # ncols=100, dynamic_ncols=False, 禁用动态宽度调整，进一步避免多进程渲染冲突
+        for cargo in tqdm(sorted_cargo, desc=f"策略 {strategy.value}", position=strategy_index, leave=True, ncols=100, dynamic_ncols=False):
             region = next((r for r in self.regions if r.name == cargo.supplier), None)
             if not region: continue
 
@@ -726,7 +514,8 @@ class SimulatedAnnealingOptimizer:
                 pos, orient = best_placement
                 solution.add_item(cargo, pos, orient)
         
-        print(f"\n初始解构建完成。")
+        final_rate = self._get_volume_ratio(solution)
+        # print(f"策略 [{strategy.value}] 构建完成。装载率: {final_rate:.2%}, 件数: {len(solution.placed_items)}")
         return solution
 
     def _get_volume_ratio(self, solution: PackingSolution) -> float:
@@ -746,6 +535,43 @@ class SimulatedAnnealingOptimizer:
             suppliers_in_solution = sorted(list(set(item.cargo.supplier for item in solution.placed_items)))
             print(f"涉及供应商: {', '.join(suppliers_in_solution)}")
         print(f">>> 优化总耗时: {duration:.2f} 秒")
+
+    def _export_solution_to_excel(self, solution: PackingSolution, save_path: str = "装载方案详情.xlsx"):
+        """将详细的装载方案导出为Excel文件。"""
+        print(f"\n正在将详细装载方案导出至Excel文件: {save_path}...")
+        
+        if not solution.placed_items:
+            print("警告：装载方案为空，无法导出Excel。")
+            return
+
+        solution_data = []
+        for item in solution.placed_items:
+            solution_data.append({
+                '貨物名稱': item.cargo.cargo_id,
+                '供應商': item.cargo.supplier,
+                '原始長度': item.cargo.original_dims[0],
+                '原始寬度': item.cargo.original_dims[1],
+                '原始高度': item.cargo.original_dims[2],
+                '放置座標X': round(item.position.x, 2),
+                '放置座標Y': round(item.position.y, 2),
+                '放置座標Z': round(item.position.z, 2),
+                '擺放方式': item.orientation.value,
+                '當前長度': item.current_dims[0],
+                '當前寬度': item.current_dims[1],
+                '當前高度': item.current_dims[2],
+            })
+        
+        df = pd.DataFrame(solution_data)
+        
+        # 按放置位置（X, Y, Z）排序，更好地反映实际装载顺序
+        print("正在根据物理位置排序方案，以便查看...")
+        df_sorted = df.sort_values(by=['放置座標X', '放置座標Y', '放置座標Z'])
+        
+        try:
+            df_sorted.to_excel(save_path, index=False, engine='openpyxl')
+            print(f"Excel文件已成功保存至: {save_path}")
+        except Exception as e:
+            print(f"错误：导出Excel文件失败。原因: {e}")
 
     def _create_3d_visualization(self, solution: PackingSolution, save_path: str = "container_3d_visualization.png"):
         """创建装载方案的3D可视化图"""
@@ -840,184 +666,89 @@ class SimulatedAnnealingOptimizer:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"3D可视化图已保存至: {save_path}")
         
-        # 显示图形（用户可以交互旋转查看）
-        plt.show()
+        # 不再调用plt.show()，因为它会阻塞程序，尤其是在非交互式环境下
+        # plt.show()
+        plt.close(fig) # 添加此行以关闭图形对象，释放内存
 
-class SmartTopSpaceFiller:
+class MultiStrategyOptimizer:
     """
-    智能顶部空间二次填充器：采用"几何感知"策略，在已装载货物顶部生成高质量候选点。
-    - 优先处理大体积剩余货物。
-    - 候选点直接生成于支撑平面上，提高成功率。
-    - 严格复用主算法的约束检查，保证方案有效性。
+    多策略并行优化器。
+    它会同时运行多种不同的贪心策略，并选出最优的结果。
     """
-    def __init__(self, optimizer: 'SimulatedAnnealingOptimizer'):
-        self.optimizer = optimizer
-        self.container_dims = optimizer.container_dims
+    def __init__(self, container_dims: Tuple[int, int, int]):
+        self.container_dims = container_dims
 
-    def _generate_golden_points(self, solution: 'PackingSolution', region: 'SupplierRegion') -> List[Position]:
-        """
-        在指定分区内，从已装载货物的顶部表面生成"黄金候选点"。
-        """
-        points = set()
-        for item in solution.placed_items:
-            # 仅在该分区的货物顶部生成点
-            if item.cargo.supplier != region.name:
-                continue
+    def optimize(self, suppliers_sequence: List[str], cargo_data: List[dict]):
+        print("启动多策略并行优化流程...")
+        start_time = time.time()
 
-            l, w, h = item.current_dims
-            x, y, z = item.position.x, item.position.y, item.position.z
-            top_z = z + h
-            
-            # 确保生成的点不会超出容器顶部
-            if top_z >= self.container_dims[2]:
-                continue
+        # 定义要并行的所有策略
+        strategies_to_run = [
+            SortingStrategy.VOLUME_DESC,
+            SortingStrategy.AREA_DESC,
+            SortingStrategy.MAX_DIM_DESC,
+            SortingStrategy.RANDOM_SHUFFLE
+        ]
 
-            # 在顶部表面生成5个最有价值的候选点
-            potential_points = [
-                Position(x, y, top_z),
-                Position(x + l, y, top_z),
-                Position(x, y + w, top_z),
-                Position(x + l, y + w, top_z),
-                Position(x + l / 2, y + w / 2, top_z)
-            ]
-            
-            for p in potential_points:
-                # 仅做Y/Z轴的粗略检查，精细的X轴和区域检查交给_is_valid_placement
-                if (0 <= p.y < self.container_dims[1] and 0 <= p.z < self.container_dims[2]):
-                    points.add(p)
+        best_solution = None
+        best_rate = 0.0
+        results = []
 
-        return sorted(list(points), key=lambda p: (p.z, p.y, p.x))
+        # 使用ProcessPoolExecutor代替ThreadPoolExecutor来实现真正的CPU并行
+        with ProcessPoolExecutor(max_workers=len(strategies_to_run)) as executor:
+            # 为每个策略提交一个任务，并传入一个唯一的索引用于进度条定位
+            future_to_strategy = {
+                executor.submit(self._run_single_strategy, strategy, suppliers_sequence, cargo_data, i): strategy
+                for i, strategy in enumerate(strategies_to_run)
+            }
 
-    def fill_top_space(self, solution: 'PackingSolution'):
-        print("\n[智能顶部空间二次填充] 开始... 共未装载%d件货物" % len(solution.unloaded_cargo_set))
-        initial_unloaded_count = len(solution.unloaded_cargo_set)
+            for future in as_completed(future_to_strategy):
+                strategy = future_to_strategy[future]
+                try:
+                    # 现在返回的是一个元组 (solution, duration)
+                    solution, duration = future.result()
+                    if solution:
+                        rate = solution.total_volume / (self.container_dims[0] * self.container_dims[1] * self.container_dims[2])
+                        results.append({'strategy': strategy.value, 'rate': rate, 'items': len(solution.placed_items), 'duration': duration})
+                        if rate > best_rate:
+                            best_rate = rate
+                            best_solution = solution
+                except Exception as exc:
+                    print(f"策略 {strategy.value} 在执行中产生错误: {exc}")
 
-        # 按供应商分区处理
-        for region in self.optimizer.regions:
-            # 1. 筛选出该分区的未装载货物，并按体积排序
-            region_unloaded = [c for c in solution.unloaded_cargo_set if c.supplier == region.name]
-            if not region_unloaded:
-                continue
-            
-            sorted_region_unloaded = sorted(region_unloaded, key=lambda c: c.volume, reverse=True)
-
-            # 2. 为该分区生成一次"黄金候选点"
-            candidate_points = self._generate_golden_points(solution, region)
-            
-            # 3. 贪心填充
-            for cargo in sorted_region_unloaded:
-                # 检查货物是否已被其他区域的填充过程处理
-                if cargo not in solution.unloaded_cargo_set:
-                    continue
-
-                found_placement = False
-                for point in candidate_points:
-                    # 使用 get_allowed_placements 尊重易碎品等层高约束
-                    for orientation in self.optimizer.layer_strategy.get_allowed_placements(point.z):
-                        try:
-                            if self.optimizer._is_valid_placement(cargo, point, orientation, solution, region):
-                                solution.add_item(cargo, point, orientation)
-                                print(f"[智能顶部填充] 货物:{cargo.cargo_id} 成功填充于({point.x:.1f},{point.y:.1f},{point.z:.1f}) 姿态:{orientation.value}")
-                                found_placement = True
-                                break # break orientation loop
-                        except Exception:
-                            pass # 异常保护
-                    if found_placement:
-                        break # break point loop
+        # --- 打印所有策略的对比报告 ---
+        print("\n\n=== 所有策略运行结果对比 ===")
+        if results:
+            # 按装载率降序排序
+            sorted_results = sorted(results, key=lambda x: x['rate'], reverse=True)
+            for res in sorted_results:
+                print(f"  - 策略: {res['strategy']:<12} | 装载率: {res['rate']:.2%} | 装载件数: {res['items']:<4}件 | 单独耗时: {res['duration']:.2f}秒")
         
-        filled_count = initial_unloaded_count - len(solution.unloaded_cargo_set)
-        print(f"[智能顶部空间二次填充] 完成，新增装载{filled_count}件货物。")
-
-class SwappingOptimizer:
-    """
-    交换策略优化器：尝试用一个未装载的大件，换掉一个已装载的小件。
-    - 核心思想：通过"1对1"交换，腾出空间，提升总体积利用率。
-    - 安全第一：引入"安全移除"检查，确保被交换的物品不支撑任何其他物品。
-    - 范围可控：只对最大的10个未装载货物尝试此策略。
-    - 严格复用：完全复用主算法的约束检查，保证方案100%有效。
-    """
-    def __init__(self, optimizer: 'SimulatedAnnealingOptimizer'):
-        self.optimizer = optimizer
-
-    def _is_safe_to_remove(self, item_to_remove: PlacedItem, solution: PackingSolution) -> bool:
-        """
-        检查一个物品是否可以被安全移除（即，其上方没有任何物品直接由它支撑）。
-        """
-        item_top_z = item_to_remove.position.z + item_to_remove.current_dims[2]
+        print("\n--- 最终择优结果 ---")
+        if best_solution:
+            # 复用GreedyContainerOptimizer的报告和可视化方法
+            temp_optimizer = GreedyContainerOptimizer(self.container_dims)
+            temp_optimizer._print_final_report(best_solution, time.time() - start_time)
+            temp_optimizer._export_solution_to_excel(best_solution)
+            temp_optimizer._create_3d_visualization(best_solution)
+        else:
+            print("错误：所有策略都未能生成有效的装载方案。")
+    
+    def _run_single_strategy(self, strategy: SortingStrategy, suppliers_sequence: List[str], cargo_data: List[dict], strategy_index: int) -> Tuple[PackingSolution, float]:
+        """运行单个贪心策略并返回结果和耗时"""
+        start_time = time.time()
+        # 每个线程拥有自己独立的优化器实例，避免线程安全问题
+        optimizer = GreedyContainerOptimizer(self.container_dims)
+        optimizer.all_cargo = optimizer._preprocess_cargo(cargo_data)
+        optimizer.regions = optimizer._create_supplier_regions(suppliers_sequence, optimizer.all_cargo)
+        optimizer.layer_strategy = LayerStrategy(optimizer.container_dims, optimizer.all_cargo)
         
-        for other_item in solution.placed_items:
-            if other_item == item_to_remove:
-                continue
-            
-            # 检查是否有其他物品的底部与此物品的顶部接触
-            if abs(other_item.position.z - item_top_z) < 0.1:
-                # 检查XY平面是否有重叠
-                x_overlap_start = max(item_to_remove.position.x, other_item.position.x)
-                x_overlap_end = min(item_to_remove.position.x + item_to_remove.current_dims[0], other_item.position.x + other_item.current_dims[0])
-                y_overlap_start = max(item_to_remove.position.y, other_item.position.y)
-                y_overlap_end = min(item_to_remove.position.y + item_to_remove.current_dims[1], other_item.position.y + other_item.current_dims[1])
-
-                if x_overlap_start < x_overlap_end and y_overlap_start < y_overlap_end:
-                    # 此物品正在支撑其他物品，不安全
-                    return False
-                    
-        return True # 未支撑任何物品，可以安全移除
-
-    def perform_swaps(self, solution: PackingSolution):
-        print("\n[交换策略优化] 开始...")
-        swapped_count = 0
+        # 这里不再打印分层，因为主函数会打印一次，避免日志重复
+        # optimizer.layer_strategy.print_layers()
         
-        # 1. 只针对体积最大的前10个未装载货物
-        largest_unloaded = sorted(list(solution.unloaded_cargo_set), key=lambda c: c.volume, reverse=True)[:10]
-        
-        for cargo_to_place in largest_unloaded:
-            # 如果此货物在之前的循环中已被成功放置，则跳过
-            if cargo_to_place not in solution.unloaded_cargo_set:
-                continue
-
-            # 2. 寻找可被交换的、更小的、且能安全移除的已装载物品
-            potential_swaps = []
-            for item in solution.placed_items:
-                if (cargo_to_place.volume > item.cargo.volume and
-                    cargo_to_place.supplier == item.cargo.supplier and
-                    self._is_safe_to_remove(item, solution)):
-                    potential_swaps.append(item)
-            
-            if not potential_swaps:
-                continue
-
-            swap_successful = False
-            for item_to_swap in potential_swaps:
-                region = next((r for r in self.optimizer.regions if r.name == cargo_to_place.supplier), None)
-                if not region: continue
-
-                pos_to_try = item_to_swap.position
-                
-                # 3. 创建一个临时方案进行验证，避免污染真实解
-                temp_solution = solution.copy()
-                item_in_temp = next((i for i in temp_solution.placed_items if i == item_to_swap), None)
-                if not item_in_temp: continue
-                temp_solution.remove_item(item_in_temp)
-
-                # 4. 尝试所有摆放方式，并用主算法的约束检查函数进行验证
-                for orientation in PlacementType:
-                    if self.optimizer._is_valid_placement(cargo_to_place, pos_to_try, orientation, temp_solution, region):
-                        print(f"[交换成功] 用 {cargo_to_place.cargo_id} (体积:{cargo_to_place.volume:.0f}) 换掉 {item_to_swap.cargo.cargo_id} (体积:{item_to_swap.cargo.volume:.0f})")
-                        
-                        # 5. 在真实解上执行交换
-                        item_in_real = next((i for i in solution.placed_items if i == item_to_swap), None)
-                        if not item_in_real: continue
-                        solution.remove_item(item_in_real)
-                        solution.add_item(cargo_to_place, pos_to_try, orientation)
-                        
-                        swapped_count += 1
-                        swap_successful = True
-                        break # 成功找到位置，跳出朝向循环
-                
-                if swap_successful:
-                    break # 成功交换，跳出可交换物品循环，处理下一个未装载大件
-        
-        print(f"[交换策略优化] 完成，共成功交换 {swapped_count} 件货物。")
+        solution = optimizer._create_initial_solution(strategy, strategy_index)
+        duration = time.time() - start_time
+        return solution, duration
 
 def load_cargo_data(file_path: str) -> Tuple[List[str], List[dict]]:
     try:
@@ -1051,7 +782,8 @@ def main():
     print(f"理论总体积: {total_volume_theoretical:.2f}cm³")
     print(f"供应商顺序: {suppliers_sequence}")
 
-    optimizer = SimulatedAnnealingOptimizer(container_dims)
+    # 改为使用多策略优化器
+    optimizer = MultiStrategyOptimizer(container_dims)
     optimizer.optimize(suppliers_sequence=suppliers_sequence, cargo_data=cargo_data)
 
 if __name__ == "__main__":
