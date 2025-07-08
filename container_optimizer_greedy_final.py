@@ -5,6 +5,7 @@ import copy
 import pandas as pd
 import numpy as np
 import re
+import os # <-- 引入os模块
 from typing import List, Tuple, Set
 from dataclasses import dataclass, field
 from enum import Enum
@@ -834,9 +835,14 @@ class PermutationOptimizer:
         if not final_results:
             print("\n错误：未能生成任何有效的装载方案。")
             return
+        
+        # --- 创建输出目录 ---
+        output_dir = "optimization_results"
+        os.makedirs(output_dir, exist_ok=True)
             
         print(f"\n\n========================================================")
         print(f"  所有计算完成，最终择优方案如下 (Top {top_n})")
+        print(f"  (所有报告文件将保存在 ./{output_dir}/ 文件夹中)")
         print(f"========================================================")
         
         final_results.sort(key=lambda x: x['rate'], reverse=True)
@@ -852,11 +858,11 @@ class PermutationOptimizer:
             print(f"  - 推荐取货顺序: {sequence_str}")
             print(f"  - 最高装柜率: {rate_str} (由'{result['strategy'].value}'策略达成)")
             
-            # 生成带唯一标识的文件名
+            # 生成带唯一标识的文件名，并加入输出目录路径
             sequence_file_str = '-'.join(result['sequence'])
             file_prefix = f"方案_{rank}_顺序_{sequence_file_str}_装载率_{result['rate']:.4f}"
-            excel_path = f"{file_prefix}.xlsx"
-            image_path = f"{file_prefix}.png"
+            excel_path = os.path.join(output_dir, f"{file_prefix}.xlsx")
+            image_path = os.path.join(output_dir, f"{file_prefix}.png")
 
             print(f"  - 正在生成详细报告: {excel_path}")
             print(f"  - 正在生成3D视图: {image_path}")
