@@ -481,7 +481,7 @@ class GreedyContainerOptimizer:
         # desc是进度条的描述，position让每个进度条独立占一行
         # leave=True, 防止因进程结束时清除进度条导致的光标混乱问题
         # ncols=100, dynamic_ncols=False, 禁用动态宽度调整，进一步避免多进程渲染冲突
-        for cargo in tqdm(sorted_cargo, desc=f"策略 {strategy.value}", position=strategy_index, leave=True, ncols=100, dynamic_ncols=False):
+        for cargo in tqdm(sorted_cargo, desc=f"顺序评估", position=strategy_index, leave=True, ncols=100, dynamic_ncols=False):
             region = next((r for r in self.regions if r.name == cargo.supplier), None)
             if not region: continue
 
@@ -674,15 +674,12 @@ class GreedyContainerOptimizer:
 class PermutationOptimizer:
     """
     排列优化器，寻找最优的供应商取货顺序。
-    实现了混合策略：
-    - 当供应商数量较少(<=4)时，进行全量暴力计算，确保找到理论最优解。(方案A)
-    - 当供应商数量较多(>4)时，启动两阶段优化，在效率和效果间取得平衡。(方案C)
+    通过并行计算，为每一种供应商顺序组合运行一次标准的贪心算法，并从中择优。
     """
     def __init__(self, container_dims: Tuple[int, int, int], cargo_data: List[dict]):
         self.container_dims = container_dims
         self.cargo_data = cargo_data
         self.all_suppliers = self._extract_suppliers(cargo_data)
-        # 将报告和可视化方法从Greedy类移到这里，由顶层控制器统一管理
         self.reporter = GreedyContainerOptimizer(container_dims)
 
     def _extract_suppliers(self, cargo_data: List[dict]) -> List[str]:
@@ -699,8 +696,8 @@ class PermutationOptimizer:
                     suppliers_sequence.append(supplier_name)
         return suppliers_sequence
 
-    def run_optimization(self, top_n_results: int = 3, supplier_threshold: int = 2, fast_screen_top_k: int = 5):
-        """主优化流程，根据供应商数量自动选择策略"""
+    def run_optimization(self, top_n_results: int = 3):
+        """主优化流程，并行评估所有供应商顺序"""
         from itertools import permutations
         
         start_time = time.time()
@@ -711,120 +708,65 @@ class PermutationOptimizer:
         print(f"\n========================================================")
         print(f"  启动供应商顺序优化流程")
         print(f"  发现 {len(self.all_suppliers)} 个供应商, 将探索 {num_sequences} 种取货顺序。")
+        print(f"  (将使用 '体积从大到小' 单一策略进行评估)")
         print(f"========================================================")
 
         if num_sequences == 0:
             print("错误：货物数据中未发现任何供应商信息，无法执行优化。")
             return
         
-        final_results = []
-        # --- 混合策略决策点 (已修复) ---
-        # 判断条件应为供应商数量，而非排列组合的数量
-        if len(self.all_suppliers) <= supplier_threshold:
-            print(f"\n模式: [方案A] 全量优化 (供应商数量 <= {supplier_threshold})")
-            print(f"将对全部 {num_sequences} 种供应商顺序进行完整的多策略优化。")
-            final_results = self._run_full_optimization_on_sequences(all_sequences)
-        else:
-            print(f"\n模式: [方案C] 两阶段优化 (供应商数量 > {supplier_threshold})")
-            # --- 第一阶段：快速筛选 ---
-            print(f"\n[第一阶段] 快速筛选 {num_sequences} 种顺序...")
-            screened_results = self._run_fast_screening(all_sequences)
-            
-            # 排序并筛选出Top-K种子选手
-            screened_results.sort(key=lambda x: x['rate'], reverse=True)
-            top_k_sequences = [res['sequence'] for res in screened_results[:fast_screen_top_k]]
-            
-            print(f"\n快速筛选完成。选出 Top-{len(top_k_sequences)} 的种子选手进入下一阶段。")
-            for i, res in enumerate(screened_results[:fast_screen_top_k]):
-                print(f"  - 候选 {i+1}: {' -> '.join(res['sequence'])}, 潜力分: {res['rate']:.2%}")
-
-            # --- 第二阶段：精细优化 ---
-            print(f"\n[第二阶段] 对 {len(top_k_sequences)} 名种子选手进行完整多策略优化...")
-            final_results = self._run_full_optimization_on_sequences(top_k_sequences)
+        final_results = self._evaluate_all_sequences(all_sequences)
 
         # --- 最终结果报告与输出 ---
         duration = time.time() - start_time
         self._generate_final_reports(final_results, top_n_results, duration)
 
-    def _run_full_optimization_on_sequences(self, sequences_to_run: List[Tuple[str, ...]]) -> List[dict]:
-        """对给定的顺序列表，并行执行完整的多策略优化"""
+    def _evaluate_all_sequences(self, sequences_to_run: List[Tuple[str, ...]]) -> List[dict]:
+        """对给定的顺序列表，并行执行单一策略优化"""
         tasks = []
-        strategies_to_run = [
-            SortingStrategy.VOLUME_DESC, SortingStrategy.AREA_DESC,
-            SortingStrategy.MAX_DIM_DESC, SortingStrategy.RANDOM_SHUFFLE
-        ]
-        
-        for seq in sequences_to_run:
-            for strat in strategies_to_run:
-                # 每个任务包含 (供应商顺序, 货物排序策略, 任务索引)
-                tasks.append((seq, strat, len(tasks)))
+        for i, seq in enumerate(sequences_to_run):
+            # 每个任务只包含 (供应商顺序, 任务索引)
+            tasks.append((seq, i))
         
         print(f"共创建 {len(tasks)} 个并行计算任务...")
         
-        results_by_sequence = {}
-        with ProcessPoolExecutor(max_workers=len(strategies_to_run) * 2) as executor:
+        all_results = []
+        # 使用CPU核心数作为并行工作线程数
+        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
             future_to_task = {
                 executor.submit(self._run_single_strategy, task): task for task in tasks
             }
             
-            for future in tqdm(as_completed(future_to_task), total=len(tasks), desc="完整优化"):
-                res = future.result()
-                if not res: continue
-                
-                sequence = res['sequence']
-                if sequence not in results_by_sequence:
-                    results_by_sequence[sequence] = []
-                results_by_sequence[sequence].append(res)
-        
-        # 从每个顺序的结果中选出最好的那个
-        best_results = []
-        for sequence, strategy_results in results_by_sequence.items():
-            best_for_seq = max(strategy_results, key=lambda x: x['rate'])
-            best_results.append(best_for_seq)
-        
-        return best_results
-
-    def _run_fast_screening(self, all_sequences: List[Tuple[str, ...]]) -> List[dict]:
-        """对所有顺序组合进行快速的单策略评估"""
-        tasks = []
-        # 固定使用最高效的体积排序策略进行快速筛选
-        screening_strategy = SortingStrategy.VOLUME_DESC
-        for seq in all_sequences:
-            tasks.append((seq, screening_strategy, len(tasks)))
-
-        screened_results = []
-        with ProcessPoolExecutor(max_workers=len(all_sequences)) as executor:
-            future_to_task = {
-                executor.submit(self._run_single_strategy, task): task for task in tasks
-            }
-            
-            for future in tqdm(as_completed(future_to_task), total=len(tasks), desc="快速评估"):
+            for future in tqdm(as_completed(future_to_task), total=len(tasks), desc="评估所有顺序"):
                 res = future.result()
                 if res:
-                    screened_results.append(res)
-        return screened_results
-
+                    all_results.append(res)
+        
+        return all_results
+    
     def _run_single_strategy(self, task: Tuple) -> dict:
         """
-        [工作单元] 运行单个策略，这是所有并行任务的最小执行单元。
-        :param task: 一个元组 (suppliers_sequence, sorting_strategy, task_index)
+        [工作单元] 运行单个供应商顺序，这是所有并行任务的最小执行单元。
+        :param task: 一个元组 (suppliers_sequence, task_index)
         :return: 一个包含结果的字典
         """
-        suppliers_sequence, sorting_strategy, task_index = task
+        suppliers_sequence, task_index = task
+        # 固定使用 '体积从大到小' 策略
+        sorting_strategy = SortingStrategy.VOLUME_DESC
         
-        # 每个进程拥有自己独立的优化器实例，确保无状态和线程安全
+        # 每个进程拥有自己独立的优化器实例
         optimizer = GreedyContainerOptimizer(self.container_dims)
         optimizer.all_cargo = optimizer._preprocess_cargo(self.cargo_data)
         optimizer.regions = optimizer._create_supplier_regions(suppliers_sequence, optimizer.all_cargo)
         optimizer.layer_strategy = LayerStrategy(optimizer.container_dims, optimizer.all_cargo)
         
+        # 运行基础的贪心算法 (补漏逻辑已被移除)
         solution = optimizer._create_initial_solution(sorting_strategy, task_index)
-        
+
         if solution and solution.placed_items:
             rate = optimizer._get_volume_ratio(solution)
             return {
                 'sequence': suppliers_sequence,
-                'strategy': sorting_strategy,
                 'rate': rate,
                 'solution': solution
             }
@@ -856,7 +798,7 @@ class PermutationOptimizer:
             
             print(f"\n--- [方案 Top {rank}] ---")
             print(f"  - 推荐取货顺序: {sequence_str}")
-            print(f"  - 最高装柜率: {rate_str} (由'{result['strategy'].value}'策略达成)")
+            print(f"  - 最高装柜率: {rate_str}")
             
             # 生成带唯一标识的文件名，并加入输出目录路径
             sequence_file_str = '-'.join(result['sequence'])
@@ -867,7 +809,7 @@ class PermutationOptimizer:
             print(f"  - 正在生成详细报告: {excel_path}")
             print(f"  - 正在生成3D视图: {image_path}")
 
-            # 调用从Greedy类移过来的报告和可视化方法
+            # 调用报告和可视化方法
             self.reporter._export_solution_to_excel(result['solution'], save_path=excel_path)
             self.reporter._create_3d_visualization(result['solution'], save_path=image_path)
             
