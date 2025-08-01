@@ -5,6 +5,7 @@ import random
 from typing import List, Set, Tuple
 
 from tqdm import tqdm
+import numpy as np
 
 from src.core.models import (Cargo, LayerStrategy, PackingSolution, PlacementType,
                              Position, SortingStrategy, SupplierRegion)
@@ -20,6 +21,7 @@ class GreedyContainerOptimizer:
         self.all_cargo: List[Cargo] = []
         self.regions: List[SupplierRegion] = []
         self.layer_strategy: LayerStrategy = None
+        self.space: np.ndarray = None # Voxel space for faster checks
 
     def _create_supplier_regions(self, suppliers_sequence: List[str], all_cargo: List[Cargo]):
         # ... (This method remains unchanged)
@@ -122,6 +124,47 @@ class GreedyContainerOptimizer:
         return (support_min_x + margin_x <= center_x <= support_max_x - margin_x and
                 support_min_y + margin_y <= center_y <= support_max_y - margin_y)
 
+    def _check_domino_effect(self, cargo: Cargo, position: Position, orientation: PlacementType, placed_item_map: dict) -> bool:
+        """
+        检查是否存在多米诺骨牌效应的风险。
+        '侧放1' (SIDE_LYING_X) 和 '躺放2' (LYING_Y) 禁止紧邻放置。
+        """
+        # 如果当前朝向不是风险朝向之一，则直接通过
+        if orientation not in [PlacementType.SIDE_LYING_X, PlacementType.LYING_Y]:
+            return True
+
+        px, _, _ = position.x, position.y, position.z
+        
+        # 我们只关心新货物后表面(X坐标较小的一面)接触到的已放置货物
+        # 因此，我们检查新货物起始X坐标-1的位置
+        if px == 0:
+            return True # 在集装箱最里面，不可能有东西在它后面
+
+        neighbor_plane = self.space[int(px) - 1, :, :]
+        neighbor_ids = np.unique(neighbor_plane[neighbor_plane > 0]) # 获取所有接触到的邻居ID
+
+        for neighbor_id in neighbor_ids:
+            neighbor_item = placed_item_map.get(int(neighbor_id))
+            if not neighbor_item: continue
+
+            # 检查邻居的朝向
+            neighbor_orientation = neighbor_item.orientation
+            
+            # 定义不允许的组合
+            forbidden_pairs = {
+                (PlacementType.SIDE_LYING_X, PlacementType.LYING_Y),
+                (PlacementType.LYING_Y, PlacementType.SIDE_LYING_X)
+            }
+            
+            if (orientation, neighbor_orientation) in forbidden_pairs:
+                # 在此可以增加更精细的接触面检查，但目前我们假设只要后方有风险物品就禁止
+                # 检查两个物品的X坐标是否真的紧邻
+                if abs((neighbor_item.position.x + neighbor_item.current_dims[0]) - px) < 0.1:
+                    return False # 发现风险组合，禁止放置
+        
+        return True
+
+
     def _is_valid_placement(self, cargo: Cargo, position: Position, orientation: PlacementType, solution: PackingSolution, region: SupplierRegion) -> bool:
         # ... (This method remains unchanged)
         cargo.set_orientation(orientation)
@@ -139,26 +182,25 @@ class GreedyContainerOptimizer:
         if not (px >= region.start_position and px + pl <= region.end_position):
             return False
 
-        for item in solution.placed_items:
-            ix, iy, iz = item.position.x, item.position.y, item.position.z
-            il, iw, ih = item.current_dims
-            
-            if (px < ix + il and px + pl > ix and
-                py < iy + iw and py + pw > iy and
-                pz < iz + ih and pz + ph > iz):
-                return False
-        
+        # Voxel-based collision check
+        if np.any(self.space[int(px):int(px+pl), int(py):int(py+pw), int(pz):int(pz+ph)]):
+            return False
+
         if pz > 0:
             if self._calculate_support_ratio(cargo, position, solution) < 0.7:
                 return False
             if not self._check_center_stability(cargo, position, solution):
                 return False
+        
+        if not self._check_domino_effect(cargo, position, orientation, solution.placed_item_map):
+            return False
                 
         return True
 
     def _create_initial_solution(self, strategy: SortingStrategy = SortingStrategy.VOLUME_DESC, strategy_index: int = 0) -> PackingSolution:
         # ... (This method remains unchanged)
         solution = PackingSolution(self.all_cargo)
+        self.space = np.zeros(self.container_dims, dtype=np.int32)
         
         sorted_cargo = []
         if strategy == SortingStrategy.VOLUME_DESC:
@@ -198,6 +240,9 @@ class GreedyContainerOptimizer:
             if best_placement:
                 pos, orient = best_placement
                 solution.add_item(cargo, pos, orient)
+                px, py, pz = int(pos.x), int(pos.y), int(pos.z)
+                pl, pw, ph = int(cargo.length), int(cargo.width), int(cargo.height)
+                self.space[px:px+pl, py:py+pw, pz:pz+ph] = cargo.unique_id
         
         return solution
 

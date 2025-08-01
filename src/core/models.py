@@ -33,8 +33,9 @@ class Position:
 
 class Cargo:
     """代表一件货物及其所有属性和状态"""
-    def __init__(self, cargo_id: str, supplier: str, length: float, width: float, height: float, weight: float):
+    def __init__(self, cargo_id: str, supplier: str, length: float, width: float, height: float, weight: float, unique_id: int):
         self.cargo_id = cargo_id
+        self.unique_id = unique_id
         self.supplier = supplier
         self.original_dims = (length, width, height)
         self.length = length
@@ -65,10 +66,10 @@ class Cargo:
     def __eq__(self, other):
         if not isinstance(other, Cargo):
             return False
-        return id(self) == id(other)
+        return self.unique_id == other.unique_id
 
     def __hash__(self):
-        return id(self)
+        return hash(self.unique_id)
 
 class PlacedItem:
     """代表一个已经放置在容器中的货物"""
@@ -92,16 +93,20 @@ class PackingSolution:
         self.total_volume = 0.0
         self.rate = 0.0
         self.sequence: Tuple[str, ...] = ()
+        self.placed_item_map: dict = {}
 
 
-    def add_item(self, cargo_to_add: Cargo, position: Position, orientation: PlacementType):
-        """向方案中添加一个新放置的货物"""
+    def add_item(self, cargo_to_add: Cargo, position: Position, orientation: PlacementType) -> PlacedItem:
+        """向方案中添加一个新放置的货物，并返回创建的PlacedItem"""
         new_item = PlacedItem(cargo_to_add, position, orientation)
         self.placed_items.append(new_item)
+        self.placed_item_map[cargo_to_add.unique_id] = new_item
         self.total_volume += cargo_to_add.volume
 
         if cargo_to_add in self.unloaded_cargo_set:
             self.unloaded_cargo_set.remove(cargo_to_add)
+        
+        return new_item
 
 class SupplierRegion:
     """定义一个供应商的装载区域"""

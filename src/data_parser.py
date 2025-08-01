@@ -43,6 +43,7 @@ class DataParser:
         """Converts raw data dictionaries into Cargo objects."""
         cargo_list = []
         supplier_pattern = re.compile(r'（(.*?)）')
+        unique_id_counter = 1
         for item in cargo_data:
             match = supplier_pattern.search(item.get('貨物名稱', ''))
             supplier_name = match.group(1) if match else "UnknownSupplier"
@@ -50,8 +51,10 @@ class DataParser:
                 cargo_list.append(Cargo(
                     cargo_id=item.get('貨物名稱', 'Unknown'),
                     supplier=supplier_name,
-                    length=item['長度'], width=item['寬度'], height=item['高度'], weight=item['重量']
+                    length=item['長度'], width=item['寬度'], height=item['高度'], weight=item['重量'],
+                    unique_id=unique_id_counter
                 ))
+                unique_id_counter += 1
         return cargo_list
 
     def extract_suppliers(self, cargo_data: List[Dict]) -> List[str]:
