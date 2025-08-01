@@ -15,3 +15,6 @@ __pycache__/
 /container_3d_visualization.png
 /方案_*.png
 /方案_*.xlsx
+/output/
+.cursor/
+/data
